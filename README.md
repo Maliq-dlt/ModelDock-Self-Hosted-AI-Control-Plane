@@ -12,8 +12,10 @@ Prasyarat: Docker Desktop dengan Docker Compose.
 
 ```powershell
 .\scripts\bootstrap.ps1
-docker compose up --build
+docker compose -p modeldock up --build
 ```
+
+Docker Desktop BuildKit membutuhkan path workspace ASCII-only. `scripts/start.ps1` otomatis memakai temporary ASCII drive saat path mengandung `—` atau aksara non-ASCII. Jika drive sementara tidak tersedia, tutup VS Code lalu rename folder ke `ModelDock-Self-Hosted-AI-Control-Plane`, buka ulang workspace, dan jalankan kembali script.
 
 Atau satu command:
 
