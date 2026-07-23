@@ -19,6 +19,12 @@ jobs:
       - run: pip install ".[test]" ruff
       - run: ruff check app tests
       - run: pytest
+      - name: Check migrations on fresh SQLite
+        env:
+          DATABASE_URL: sqlite+aiosqlite:///./.tmp/ci-migrations.db
+        run: |
+          mkdir -p .tmp
+          alembic -c alembic.ini upgrade head
 
   web:
     runs-on: ubuntu-latest
@@ -30,5 +36,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - run: npm install
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - run: npm ci
+      - run: npm run lint
       - run: npm run build

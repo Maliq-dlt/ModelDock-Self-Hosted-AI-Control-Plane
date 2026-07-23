@@ -3,8 +3,8 @@
 Manifest runs API, web, PostgreSQL, and Redis in one namespace. It expects locally available images:
 
 ```powershell
-docker build -f apps/api/Dockerfile -t modeldock-api:0.1.0 .
-docker build -f apps/web/Dockerfile -t modeldock-web:0.1.0 .
+docker build -f apps/api/Dockerfile -t modeldock-api:0.2.0 .
+docker build -f apps/web/Dockerfile -t modeldock-web:0.2.0 .
 ```
 
 Create strong secrets outside Git, then apply:
@@ -21,4 +21,4 @@ kubectl -n modeldock create secret generic modeldock-secrets `
 kubectl apply -f deployments/kubernetes/modeldock.yaml
 ```
 
-For production, replace in-cluster PostgreSQL/Redis with managed HA services, use an Ingress with TLS, external secret management, image registry references, backup jobs, and region-local gateway deployments. Manifest is single-cluster baseline, not a multi-region control plane.
+NetworkPolicy baseline permits DNS and provider egress on TCP 80/443. Restrict it to required destinations for production. Replace in-cluster PostgreSQL/Redis with managed HA services, use an Ingress with TLS, external secret management, image registry references, backup jobs, and region-local gateway deployments. Manifest is single-cluster baseline, not a multi-region control plane.

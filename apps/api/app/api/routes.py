@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import Integer, func, select, text
 from sqlalchemy.exc import IntegrityError
@@ -15,12 +15,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.concurrency import request_slot
 from app.core.config import get_settings
 from app.core.db import get_session
-from app.core.security import CredentialConfigurationError, create_admin_token, create_api_key, encrypt_credentials, hash_password, require_admin, require_admin_role, require_api_key, verify_password
+from app.core.security import CredentialConfigurationError, create_admin_token, create_api_key, encrypt_credentials, hash_password, require_admin, require_admin_role, require_admin_user, require_api_key, verify_password
 from app.models import APIKey, AdminUser, AuditLog, Budget, Environment, Evaluation, ModelRecord, PromptTemplate, PromptVersion, Project, Provider, RequestAttempt, RequestRecord, RoutingRule, VirtualModel
 from app.providers.adapters import ProviderError, adapter_for
-from app.schemas import APIKeyCreate, APIKeyUpdate, AdminLogin, AdminUserCreate, BudgetCreate, BudgetUpdate, ChatCompletionRequest, EvaluationRun, ModelCreate, ModelUpdate, PromptActivate, PromptCreate, PromptRender, PromptVersionCreate, ProjectCreate, ProviderCreate, ProviderUpdate, RoutingRuleCreate, RoutingRuleUpdate, RoutingSimulation, VirtualModelCreate, VirtualModelUpdate
+from app.schemas import APIKeyCreate, APIKeyUpdate, AdminLogin, AdminUserCreate, AdminUserUpdate, BudgetCreate, BudgetUpdate, ChatCompletionRequest, EvaluationRun, ModelCreate, ModelUpdate, PromptActivate, PromptCreate, PromptRender, PromptVersionCreate, ProjectCreate, ProviderCreate, ProviderUpdate, RoutingRuleCreate, RoutingRuleUpdate, RoutingSimulation, VirtualModelCreate, VirtualModelUpdate
 from app.routing.engine import resolve_route
+from app.services.evaluations import evaluate_payload, process_next_evaluation
 from app.services.gateway import BudgetExceeded, QuotaExceeded, execute_chat, prepare_stream_chat, stream_chat_events
+from app.services.provider_health import record_provider_failure, record_provider_success
 from app.services.retention import purge_retained_data
 
 router = APIRouter()
@@ -31,16 +33,19 @@ def project_json(project: Project) -> dict[str, Any]:
     return {"id": project.id, "name": project.name, "slug": project.slug, "description": project.description, "created_at": project.created_at}
 
 def provider_json(provider: Provider) -> dict[str, Any]:
-    return {"id": provider.id, "name": provider.name, "provider_type": provider.provider_type, "base_url": provider.base_url, "timeout_seconds": provider.timeout_seconds, "enabled": provider.enabled, "has_credentials": bool(provider.encrypted_credentials), "health_status": provider.health_status, "last_health_checked_at": provider.last_health_checked_at, "last_health_latency_ms": provider.last_health_latency_ms, "created_at": provider.created_at, "updated_at": provider.updated_at}
+    return {"id": provider.id, "name": provider.name, "provider_type": provider.provider_type, "base_url": provider.base_url, "timeout_seconds": provider.timeout_seconds, "concurrency_limit": provider.concurrency_limit, "enabled": provider.enabled, "has_credentials": bool(provider.encrypted_credentials), "health_status": provider.health_status, "last_health_checked_at": provider.last_health_checked_at, "last_health_latency_ms": provider.last_health_latency_ms, "consecutive_failures": provider.consecutive_failures, "circuit_open_until": provider.circuit_open_until, "reliability_score": provider.reliability_score, "created_at": provider.created_at, "updated_at": provider.updated_at}
 
 def model_json(model: ModelRecord) -> dict[str, Any]:
-    return {"id": model.id, "provider_id": model.provider_id, "model_name": model.model_name, "display_name": model.display_name, "context_window": model.context_window, "capabilities": model.capabilities_json, "pricing": model.pricing_json, "tags": model.tags_json, "enabled": model.enabled, "created_at": model.created_at, "updated_at": model.updated_at}
+    return {"id": model.id, "provider_id": model.provider_id, "model_name": model.model_name, "display_name": model.display_name, "context_window": model.context_window, "capabilities": model.capabilities_json, "pricing": model.pricing_json, "tags": model.tags_json, "quality_score": model.quality_score, "enabled": model.enabled, "created_at": model.created_at, "updated_at": model.updated_at}
 
 def virtual_model_json(model: VirtualModel) -> dict[str, Any]:
-    return {"id": model.id, "project_id": model.project_id, "name": model.name, "strategy": model.strategy, "candidates": model.configuration_json.get("candidates", []), "enabled": model.enabled, "created_at": model.created_at, "updated_at": model.updated_at}
+    return {"id": model.id, "project_id": model.project_id, "name": model.name, "strategy": model.strategy, "candidates": model.configuration_json.get("candidates", []), "strategy_config": model.configuration_json.get("strategy_config", {}), "enabled": model.enabled, "created_at": model.created_at, "updated_at": model.updated_at}
 
 def budget_json(budget: Budget) -> dict[str, Any]:
     return {"id": budget.id, "scope_type": budget.scope_type, "scope_id": budget.scope_id, "period": budget.period, "limit_amount": budget.limit_amount, "warning_threshold": budget.warning_threshold, "action_at_limit": budget.action_at_limit, "created_at": budget.created_at, "updated_at": budget.updated_at}
+
+def evaluation_json(item: Evaluation) -> dict[str, Any]:
+    return {"id": item.id, "request_id": item.request_id, "evaluation_type": item.evaluation_type, "status": item.status, "score": item.score, "result": item.result_json, "error": item.error_message, "started_at": item.started_at, "completed_at": item.completed_at, "created_at": item.created_at}
 
 async def commit_or_conflict(session: AsyncSession, message: str) -> None:
     try:
@@ -89,7 +94,7 @@ async def create_provider(payload: ProviderCreate, session: AsyncSession = Depen
         encrypted = encrypt_credentials(payload.credentials) if payload.credentials else None
     except CredentialConfigurationError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    provider = Provider(name=payload.name, provider_type=payload.provider_type, encrypted_credentials=encrypted, base_url=payload.base_url, timeout_seconds=payload.timeout_seconds, enabled=payload.enabled)
+    provider = Provider(name=payload.name, provider_type=payload.provider_type, encrypted_credentials=encrypted, base_url=payload.base_url, timeout_seconds=payload.timeout_seconds, concurrency_limit=payload.concurrency_limit, enabled=payload.enabled)
     session.add(provider)
     await commit_or_conflict(session, "Provider name already exists")
     return provider_json(provider)
@@ -137,16 +142,20 @@ async def test_provider(provider_id: str, session: AsyncSession = Depends(get_se
     started = time.perf_counter()
     try:
         healthy = await adapter_for(provider, model).health_check()
-        provider.health_status = "healthy" if healthy else "unhealthy"
-        error = None
+        latency_ms = (time.perf_counter() - started) * 1000
+        if healthy:
+            record_provider_success(provider, latency_ms)
+            error = None
+        else:
+            record_provider_failure(provider, latency_ms)
+            error = "Provider health check failed"
     except (ProviderError, CredentialConfigurationError) as exc:
         healthy = False
-        provider.health_status = "unhealthy"
+        latency_ms = (time.perf_counter() - started) * 1000
+        record_provider_failure(provider, latency_ms)
         error = str(exc)
-    provider.last_health_checked_at = datetime.now(timezone.utc)
-    provider.last_health_latency_ms = (time.perf_counter() - started) * 1000
     await session.commit()
-    return {"healthy": healthy, "health_status": provider.health_status, "latency_ms": provider.last_health_latency_ms, **({"error": error} if error else {})}
+    return {"healthy": healthy, "health_status": provider.health_status, "latency_ms": provider.last_health_latency_ms, "consecutive_failures": provider.consecutive_failures, "circuit_open_until": provider.circuit_open_until, **({"error": error} if error else {})}
 
 @admin.get("/models")
 async def list_models(session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
@@ -156,7 +165,7 @@ async def list_models(session: AsyncSession = Depends(get_session)) -> list[dict
 async def create_model(payload: ModelCreate, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     if not await session.get(Provider, payload.provider_id):
         raise HTTPException(status_code=404, detail="Provider not found")
-    model = ModelRecord(provider_id=payload.provider_id, model_name=payload.model_name, display_name=payload.display_name, context_window=payload.context_window, capabilities_json=payload.capabilities, pricing_json=payload.pricing, tags_json=payload.tags, enabled=payload.enabled)
+    model = ModelRecord(provider_id=payload.provider_id, model_name=payload.model_name, display_name=payload.display_name, context_window=payload.context_window, capabilities_json=payload.capabilities, pricing_json=payload.pricing, tags_json=payload.tags, quality_score=payload.quality_score, enabled=payload.enabled)
     session.add(model)
     await commit_or_conflict(session, "Model already exists for provider")
     return model_json(model)
@@ -188,7 +197,7 @@ async def list_virtual_models(session: AsyncSession = Depends(get_session)) -> l
 async def create_virtual_model(payload: VirtualModelCreate, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     if not await session.get(Project, payload.project_id):
         raise HTTPException(status_code=404, detail="Project not found")
-    model = VirtualModel(project_id=payload.project_id, name=payload.name, strategy=payload.strategy, configuration_json={"candidates": payload.candidates}, enabled=payload.enabled)
+    model = VirtualModel(project_id=payload.project_id, name=payload.name, strategy=payload.strategy, configuration_json={"candidates": payload.candidates, "strategy_config": payload.strategy_config}, enabled=payload.enabled)
     session.add(model)
     await commit_or_conflict(session, "Virtual model name already exists in project")
     return virtual_model_json(model)
@@ -207,8 +216,13 @@ async def update_virtual_model(virtual_model_id: str, payload: VirtualModelUpdat
         raise HTTPException(status_code=404, detail="Virtual model not found")
     values = payload.model_dump(exclude_unset=True)
     candidates = values.pop("candidates", None)
+    strategy_config = values.pop("strategy_config", None)
+    configuration = dict(model.configuration_json or {})
     if candidates is not None:
-        model.configuration_json = {**model.configuration_json, "candidates": candidates}
+        configuration["candidates"] = candidates
+    if strategy_config is not None:
+        configuration["strategy_config"] = strategy_config
+    model.configuration_json = configuration
     for key, value in values.items():
         setattr(model, key, value)
     await commit_or_conflict(session, "Virtual model name already exists in project")
@@ -401,26 +415,37 @@ async def chat_completions(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> JSONResponse:
     if payload.stream:
+        slot = request_slot(f"api-key:{api_key.id}", api_key.concurrent_limit)
+        try:
+            await slot.__aenter__()
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"error": {"message": str(exc.detail), "type": "concurrency_limit", "code": "concurrency_limit"}})
         try:
             trace_id, replay, record, candidates, decision, prompt_tokens = await prepare_stream_chat(session, api_key, payload, idempotency_key)
         except (BudgetExceeded, QuotaExceeded) as exc:
+            await slot.__aexit__(None, None, None)
             error_type = "budget_exceeded" if isinstance(exc, BudgetExceeded) else "quota_exceeded"
             return JSONResponse(status_code=402 if error_type == "budget_exceeded" else 429, content={"error": {"message": str(exc), "type": error_type, "code": error_type}, "modeldock": {"trace_id": exc.trace_id}}, headers={"X-ModelDock-Trace-ID": exc.trace_id})
+        except BaseException:
+            await slot.__aexit__(None, None, None)
+            raise
 
         async def events():
-            if replay:
-                message = ((replay.get("choices") or [{}])[0].get("message") or {})
-                payload_chunk = {"id": replay.get("id"), "object": "chat.completion.chunk", "created": int(time.time()), "model": replay.get("model", payload.model), "choices": [{"index": 0, "delta": {"content": message.get("content") or ""}, "finish_reason": None}], "modeldock": replay.get("modeldock", {"trace_id": trace_id})}
-                yield f'data: {json.dumps(payload_chunk, separators=(",", ":"))}\n\n'
-                yield "data: [DONE]\n\n"
-                return
-            async with request_slot(api_key.id, api_key.concurrent_limit):
+            try:
+                if replay:
+                    message = ((replay.get("choices") or [{}])[0].get("message") or {})
+                    payload_chunk = {"id": replay.get("id"), "object": "chat.completion.chunk", "created": int(time.time()), "model": replay.get("model", payload.model), "choices": [{"index": 0, "delta": {"content": message.get("content") or ""}, "finish_reason": None}], "modeldock": replay.get("modeldock", {"trace_id": trace_id})}
+                    yield f'data: {json.dumps(payload_chunk, separators=(",", ":"))}\n\n'
+                    yield "data: [DONE]\n\n"
+                    return
                 async for event in stream_chat_events(session, payload, trace_id, record, candidates, decision, prompt_tokens, idempotency_key):
                     yield event
+            finally:
+                await slot.__aexit__(None, None, None)
 
         return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-ModelDock-Trace-ID": trace_id})
     try:
-        async with request_slot(api_key.id, api_key.concurrent_limit):
+        async with request_slot(f"api-key:{api_key.id}", api_key.concurrent_limit):
             response, trace_id = await execute_chat(session, api_key, payload, idempotency_key)
     except (BudgetExceeded, QuotaExceeded) as exc:
         error_type = "budget_exceeded" if isinstance(exc, BudgetExceeded) else "quota_exceeded"
@@ -543,52 +568,38 @@ async def render_prompt(prompt_id: str, payload: PromptRender, session: AsyncSes
 @admin.get("/evaluations")
 async def list_evaluations(session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
     rows = (await session.scalars(select(Evaluation).order_by(Evaluation.created_at.desc()))).all()
-    return [{"id": item.id, "request_id": item.request_id, "evaluation_type": item.evaluation_type, "score": item.score, "result": item.result_json, "created_at": item.created_at} for item in rows]
+    return [evaluation_json(item) for item in rows]
 
 @admin.post("/evaluations/run", status_code=status.HTTP_201_CREATED)
-async def run_evaluation(payload: EvaluationRun, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    request_record = await session.get(RequestRecord, payload.request_id) if payload.request_id else None
-    if payload.request_id and not request_record:
-        raise HTTPException(status_code=404, detail="Request not found")
-    output = payload.output_text
-    if output is None and request_record:
-        output = ((request_record.metadata_json or {}).get("response") or {}).get("content")
-    output = output or ""
-    passed = 0
-    total = 0
-    failures = []
-    for check, expected in payload.checks.items():
-        total += 1
-        ok = True
-        if check == "contains":
-            values = expected if isinstance(expected, list) else [expected]
-            ok = all(str(value) in output for value in values)
-        elif check == "regex":
-            ok = re.search(str(expected), output) is not None
-        elif check == "exact_match":
-            ok = output == str(expected)
-        elif check == "min_length":
-            ok = len(output) >= int(expected)
-        elif check == "max_latency_ms":
-            ok = bool(request_record and request_record.latency_ms is not None and request_record.latency_ms <= float(expected))
-        elif check == "max_cost_usd":
-            ok = bool(request_record and request_record.estimated_cost <= float(expected))
-        if ok:
-            passed += 1
-        else:
-            failures.append(check)
-    score = passed / total if total else 0.0
-    evaluation = Evaluation(request_id=payload.request_id, evaluation_type="rule_set", score=score, result_json={"passed": passed, "total": total, "failures": failures, "checks": payload.checks})
+async def run_evaluation(payload: EvaluationRun, response: Response, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    payload_data = payload.model_dump(mode="json")
+    if payload.asynchronous:
+        evaluation = Evaluation(request_id=payload.request_id, evaluation_type=payload.evaluation_type, status="queued", payload_json=payload_data)
+        session.add(evaluation)
+        await session.commit()
+        response.status_code = status.HTTP_202_ACCEPTED
+        return evaluation_json(evaluation)
+    try:
+        evaluation_type, score, result = await evaluate_payload(session, payload_data)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    now = datetime.now(timezone.utc)
+    evaluation = Evaluation(request_id=payload.request_id, evaluation_type=evaluation_type, status="completed", score=score, result_json=result, payload_json=payload_data, started_at=now, completed_at=now)
     session.add(evaluation)
     await session.commit()
-    return {"id": evaluation.id, "request_id": evaluation.request_id, "evaluation_type": evaluation.evaluation_type, "score": evaluation.score, "result": evaluation.result_json}
+    return evaluation_json(evaluation)
+
+@admin.post("/evaluations/process-next")
+async def process_evaluation_queue(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    evaluation = await process_next_evaluation(session)
+    return {"processed": evaluation is not None, **({"evaluation": evaluation_json(evaluation)} if evaluation else {})}
 
 @admin.get("/evaluations/{evaluation_id}")
 async def get_evaluation(evaluation_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     item = await session.get(Evaluation, evaluation_id)
     if not item:
         raise HTTPException(status_code=404, detail="Evaluation not found")
-    return {"id": item.id, "request_id": item.request_id, "evaluation_type": item.evaluation_type, "score": item.score, "result": item.result_json, "created_at": item.created_at}
+    return evaluation_json(item)
 
 @admin.get("/audit-logs")
 async def list_audit_logs(limit: int = Query(default=100, ge=1, le=500), session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
@@ -606,13 +617,25 @@ async def admin_login(payload: AdminLogin, session: AsyncSession = Depends(get_s
         raise HTTPException(status_code=401, detail="Invalid credentials")
     return {"access_token": create_admin_token(user), "token_type": "bearer", "role": user.role, "expires_in": 8 * 60 * 60}
 
+@auth_router.get("/me")
+async def current_admin_user(user: AdminUser = Depends(require_admin_user)) -> dict[str, Any]:
+    return {"id": user.id, "email": user.email, "role": user.role, "active": user.active}
+
+@auth_router.post("/logout-all")
+async def revoke_admin_sessions(user: AdminUser = Depends(require_admin_user), session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    user.session_version += 1
+    await session.commit()
+    return {"revoked": True}
+
 @auth_router.get("/users")
 async def list_admin_users(_: AdminUser | None = Depends(require_admin_role("owner", "admin")), session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
     rows = (await session.scalars(select(AdminUser).order_by(AdminUser.created_at))).all()
     return [{"id": item.id, "email": item.email, "role": item.role, "active": item.active, "created_at": item.created_at} for item in rows]
 
 @auth_router.post("/users", status_code=status.HTTP_201_CREATED)
-async def create_admin_user(payload: AdminUserCreate, _: AdminUser | None = Depends(require_admin_role("owner", "admin")), session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+async def create_admin_user(payload: AdminUserCreate, actor: AdminUser | None = Depends(require_admin_role("owner", "admin")), session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    if actor is not None and actor.role != "owner" and payload.role == "owner":
+        raise HTTPException(status_code=403, detail="Only owners can create owners")
     user = AdminUser(email=payload.email.lower(), password_hash=hash_password(payload.password), role=payload.role)
     session.add(user)
     try:
@@ -620,6 +643,21 @@ async def create_admin_user(payload: AdminUserCreate, _: AdminUser | None = Depe
     except IntegrityError as exc:
         await session.rollback()
         raise HTTPException(status_code=409, detail="Email already exists") from exc
+    return {"id": user.id, "email": user.email, "role": user.role, "active": user.active}
+
+@auth_router.patch("/users/{user_id}")
+async def update_admin_user(user_id: str, payload: AdminUserUpdate, actor: AdminUser | None = Depends(require_admin_role("owner", "admin")), session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    user = await session.get(AdminUser, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Admin user not found")
+    values = payload.model_dump(exclude_unset=True)
+    if actor is not None and actor.role != "owner" and (user.role == "owner" or values.get("role") == "owner"):
+        raise HTTPException(status_code=403, detail="Only owners can manage owners")
+    if values:
+        for key, value in values.items():
+            setattr(user, key, value)
+        user.session_version += 1
+        await session.commit()
     return {"id": user.id, "email": user.email, "role": user.role, "active": user.active}
 
 router.include_router(auth_router)

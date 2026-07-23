@@ -10,10 +10,12 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.concurrency import request_slot
 from app.core.config import get_settings
 from app.models import APIKey, Budget, Environment, ModelRecord, RequestAttempt, RequestRecord
 from app.providers.adapters import ProviderError, ProviderResponse, adapter_for
 from app.routing.engine import resolve_route
+from app.services.provider_health import record_provider_failure, record_provider_success
 from app.schemas import ChatCompletionRequest
 
 
@@ -231,8 +233,21 @@ async def execute_chat(
             await session.flush()
             started = time.perf_counter()
             try:
-                response = await adapter_for(candidate.provider, candidate.model).chat(request)
+                try:
+                    async with request_slot(
+                        f"provider:{candidate.provider.id}",
+                        candidate.provider.concurrency_limit or 1,
+                    ):
+                        response = await adapter_for(candidate.provider, candidate.model).chat(request)
+                except HTTPException as exc:
+                    raise ProviderError(
+                        exc.status_code,
+                        "provider_concurrency_limit",
+                        str(exc.detail),
+                        retryable=True,
+                    ) from exc
                 latency_ms = (time.perf_counter() - started) * 1000
+                record_provider_success(candidate.provider, latency_ms)
                 response_prompt_tokens = response.usage.get("prompt_tokens") or prompt_tokens
                 completion_tokens = response.usage.get("completion_tokens") or 0
                 total_tokens = response.usage.get("total_tokens") or (
@@ -278,6 +293,8 @@ async def execute_chat(
                 return response_body, trace_id
             except ProviderError as exc:
                 latency_ms = (time.perf_counter() - started) * 1000
+                if exc.retryable and exc.error_type != "provider_concurrency_limit":
+                    record_provider_failure(candidate.provider, latency_ms)
                 final_error = exc
                 attempt.status = "error"
                 attempt.error_type = exc.error_type
@@ -396,15 +413,28 @@ async def stream_chat_events(
             usage = {"prompt_tokens": prompt_tokens, "completion_tokens": 0, "total_tokens": prompt_tokens}
             streamed = False
             try:
-                async for chunk in adapter_for(candidate.provider, candidate.model).stream_chat(request):
-                    streamed = True
-                    content_parts.append(chunk.delta)
-                    if chunk.usage:
-                        usage = chunk.usage
-                    yield _stream_event(completion_id, request, trace_id, chunk.delta)
+                try:
+                    async with request_slot(
+                        f"provider:{candidate.provider.id}",
+                        candidate.provider.concurrency_limit or 1,
+                    ):
+                        async for chunk in adapter_for(candidate.provider, candidate.model).stream_chat(request):
+                            streamed = True
+                            content_parts.append(chunk.delta)
+                            if chunk.usage:
+                                usage = chunk.usage
+                            yield _stream_event(completion_id, request, trace_id, chunk.delta)
+                except HTTPException as exc:
+                    raise ProviderError(
+                        exc.status_code,
+                        "provider_concurrency_limit",
+                        str(exc.detail),
+                        retryable=True,
+                    ) from exc
                 usage["completion_tokens"] = usage.get("completion_tokens", 0) or max(0, len("".join(content_parts)) // 4)
                 usage["total_tokens"] = usage.get("total_tokens", 0) or usage["prompt_tokens"] + usage["completion_tokens"]
                 latency_ms = (time.perf_counter() - started) * 1000
+                record_provider_success(candidate.provider, latency_ms)
                 cost = estimate_cost(candidate.model, usage["prompt_tokens"], usage["completion_tokens"])
                 attempt.status = "success"
                 attempt.latency_ms = latency_ms
@@ -428,6 +458,8 @@ async def stream_chat_events(
                 yield "data: [DONE]\n\n"
                 return
             except ProviderError as exc:
+                if exc.retryable and exc.error_type != "provider_concurrency_limit":
+                    record_provider_failure(candidate.provider, (time.perf_counter() - started) * 1000)
                 final_error = exc
                 attempt.status = "error"
                 attempt.error_type = exc.error_type
@@ -438,6 +470,8 @@ async def stream_chat_events(
                 if streamed or not exc.retryable or retry_index >= settings.max_retries_per_provider:
                     break
                 await asyncio.sleep(0.05 * (2**retry_index))
+        if streamed and final_error:
+            break
     record.status = "error"
     record.latency_ms = (time.perf_counter() - started_request) * 1000
     record.completed_at = datetime.now(timezone.utc)

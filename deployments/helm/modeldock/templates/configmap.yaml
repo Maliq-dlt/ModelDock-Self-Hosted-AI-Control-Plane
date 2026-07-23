@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "modeldock.fullname" . }}-config
+  labels:
+    {{- include "modeldock.labels" . | nindent 4 }}
+data:
+  APP_ENV: {{ .Values.config.appEnv | quote }}
+  CORS_ORIGINS: {{ .Values.config.corsOrigins | quote }}
+  REQUEST_RETENTION_DAYS: {{ .Values.config.requestRetentionDays | quote }}
+  CIRCUIT_BREAKER_FAILURE_THRESHOLD: {{ .Values.config.circuitBreakerFailureThreshold | quote }}
+  CIRCUIT_BREAKER_COOLDOWN_SECONDS: {{ .Values.config.circuitBreakerCooldownSeconds | quote }}

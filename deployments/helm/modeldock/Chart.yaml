@@ -1,0 +1,6 @@
+apiVersion: v2
+name: modeldock
+description: Self-hosted AI control plane with gateway, dashboard, and evaluation worker
+type: application
+version: 0.2.0
+appVersion: "0.2.0"

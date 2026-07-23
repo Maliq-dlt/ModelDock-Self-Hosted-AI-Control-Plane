@@ -1,0 +1,123 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "modeldock.fullname" . }}-api
+  labels:
+    {{- include "modeldock.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ .Values.api.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: api
+    spec:
+      containers:
+        - name: api
+          image: "{{ .Values.image.api.repository }}:{{ .Values.image.api.tag }}"
+          imagePullPolicy: {{ .Values.image.api.pullPolicy }}
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: {{ include "modeldock.fullname" . }}-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "modeldock.secretName" . }}
+                  key: {{ .Values.external.databaseUrlKey | quote }}
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "modeldock.secretName" . }}
+                  key: {{ .Values.external.redisUrlKey | quote }}
+            - name: ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "modeldock.secretName" . }}
+                  key: {{ .Values.external.adminApiKey | quote }}
+            - name: ADMIN_SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "modeldock.secretName" . }}
+                  key: {{ .Values.external.adminSessionSecret | quote }}
+            - name: API_KEY_HASH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "modeldock.secretName" . }}
+                  key: {{ .Values.external.apiKeyHashSecret | quote }}
+            - name: CREDENTIAL_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "modeldock.secretName" . }}
+                  key: {{ .Values.external.credentialEncryptionKey | quote }}
+          readinessProbe:
+            httpGet: { path: /ready, port: 8080 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: 8080 }
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "modeldock.fullname" . }}-worker
+  labels:
+    {{- include "modeldock.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: worker
+    spec:
+      containers:
+        - name: worker
+          image: "{{ .Values.image.api.repository }}:{{ .Values.image.api.tag }}"
+          imagePullPolicy: {{ .Values.image.api.pullPolicy }}
+          command: ["python", "scripts/evaluation_worker.py", "--interval", "{{ .Values.worker.intervalSeconds }}"]
+          envFrom:
+            - configMapRef:
+                name: {{ include "modeldock.fullname" . }}-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "modeldock.secretName" . }}
+                  key: {{ .Values.external.databaseUrlKey | quote }}
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "modeldock.secretName" . }}
+                  key: {{ .Values.external.redisUrlKey | quote }}
+            - name: ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "modeldock.secretName" . }}
+                  key: {{ .Values.external.adminApiKey | quote }}
+            - name: API_KEY_HASH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "modeldock.secretName" . }}
+                  key: {{ .Values.external.apiKeyHashSecret | quote }}
+            - name: CREDENTIAL_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "modeldock.secretName" . }}
+                  key: {{ .Values.external.credentialEncryptionKey | quote }}

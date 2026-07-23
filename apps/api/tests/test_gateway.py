@@ -1,7 +1,11 @@
+from contextlib import asynccontextmanager
+
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.providers.adapters import ProviderError, ProviderResponse
+from app.providers.adapters import ProviderError, ProviderResponse, ProviderStreamChunk
+import app.api.routes as routes
 import app.services.gateway as gateway
 
 
@@ -62,3 +66,58 @@ def test_openai_gateway_fallback_trace_usage_and_budget(monkeypatch) -> None:
         blocked_trace = client.get(f"/api/traces/{blocked.headers['X-ModelDock-Trace-ID']}", headers=headers)
         assert blocked_trace.status_code == 200
         assert blocked_trace.json()["status"] == "blocked"
+
+
+class PartialStreamAdapter:
+    calls: list[str] = []
+
+    def __init__(self, model_name: str) -> None:
+        self.model_name = model_name
+
+    async def stream_chat(self, request):
+        type(self).calls.append(self.model_name)
+        if self.model_name == "partial-primary-model":
+            yield ProviderStreamChunk(delta="partial output")
+            raise ProviderError(503, "provider_unavailable", "stream failed", retryable=True)
+        yield ProviderStreamChunk(delta="fallback output", finish_reason="stop")
+
+
+def test_stream_does_not_fallback_after_partial_output(monkeypatch) -> None:
+    PartialStreamAdapter.calls = []
+    monkeypatch.setattr(gateway, "adapter_for", lambda provider, model: PartialStreamAdapter(model.model_name))
+    admin_headers = {"X-ModelDock-Admin-Key": "test-admin-key"}
+    with TestClient(app) as client:
+        project = client.post("/api/projects", headers=admin_headers, json={"name": "Stream Project", "slug": "stream-project"}).json()
+        model_ids = []
+        for provider_name, model_name in (("partial-primary", "partial-primary-model"), ("stream-fallback", "stream-fallback-model")):
+            provider = client.post("/api/providers", headers=admin_headers, json={"name": provider_name, "provider_type": "ollama", "base_url": "http://unused"}).json()
+            model = client.post("/api/models", headers=admin_headers, json={"provider_id": provider["id"], "model_name": model_name}).json()
+            model_ids.append(model["id"])
+        client.post("/api/virtual-models", headers=admin_headers, json={"project_id": project["id"], "name": "stream-router", "strategy": "priority", "candidates": [{"model_id": model_ids[0]}, {"model_id": model_ids[1]}]})
+        raw_key = client.post("/api/api-keys", headers=admin_headers, json={"project_id": project["id"], "name": "stream-client", "environment": "test"}).json()["raw_key"]
+
+        with client.stream("POST", "/v1/chat/completions", headers={"Authorization": f"Bearer {raw_key}"}, json={"model": "stream-router", "stream": True, "messages": [{"role": "user", "content": "hello"}]}) as response:
+            body = "".join(response.iter_text())
+
+        assert response.status_code == 200
+        assert "partial output" in body
+        assert "fallback output" not in body
+        assert "provider_unavailable" in body
+        assert PartialStreamAdapter.calls == ["partial-primary-model"]
+
+
+def test_stream_concurrency_limit_returns_429_before_sse(monkeypatch) -> None:
+    @asynccontextmanager
+    async def denied_slot(subject, limit):
+        raise HTTPException(status_code=429, detail="Concurrent request limit exceeded")
+        yield
+
+    monkeypatch.setattr(routes, "request_slot", denied_slot)
+    admin_headers = {"X-ModelDock-Admin-Key": "test-admin-key"}
+    with TestClient(app) as client:
+        project = client.post("/api/projects", headers=admin_headers, json={"name": "Limited Stream Project", "slug": "limited-stream-project"}).json()
+        raw_key = client.post("/api/api-keys", headers=admin_headers, json={"project_id": project["id"], "name": "limited-stream-client", "environment": "test"}).json()["raw_key"]
+        response = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {raw_key}"}, json={"model": "unused", "stream": True, "messages": [{"role": "user", "content": "hello"}]})
+
+        assert response.status_code == 429
+        assert response.json()["error"]["type"] == "concurrency_limit"

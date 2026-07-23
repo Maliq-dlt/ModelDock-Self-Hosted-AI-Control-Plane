@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     credential_encryption_key: str = ""
     request_timeout_seconds: float = 60.0
     max_retries_per_provider: int = 1
+    circuit_breaker_failure_threshold: int = 3
+    circuit_breaker_cooldown_seconds: int = 60
     rate_limit_per_minute: int = 60
     max_request_body_bytes: int = 1_048_576
     log_payloads: bool = False

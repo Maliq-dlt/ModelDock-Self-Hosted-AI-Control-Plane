@@ -1,4 +1,5 @@
 from datetime import datetime
+from math import isfinite
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -46,6 +47,7 @@ class ProviderCreate(BaseModel):
     credentials: dict[str, Any] = Field(default_factory=dict)
     base_url: str | None = None
     timeout_seconds: float = Field(default=30, gt=0, le=300)
+    concurrency_limit: int = Field(default=8, ge=1, le=10_000)
     enabled: bool = True
 
     @model_validator(mode="after")
@@ -60,6 +62,7 @@ class ProviderUpdate(BaseModel):
     credentials: dict[str, Any] | None = None
     base_url: str | None = None
     timeout_seconds: float | None = Field(default=None, gt=0, le=300)
+    concurrency_limit: int | None = Field(default=None, ge=1, le=10_000)
     enabled: bool | None = None
 
 
@@ -71,6 +74,7 @@ class ModelCreate(BaseModel):
     capabilities: list[str] = Field(default_factory=lambda: ["chat"])
     pricing: dict[str, float] = Field(default_factory=dict)
     tags: list[str] = Field(default_factory=list)
+    quality_score: float = Field(default=0.5, ge=0, le=1)
     enabled: bool = True
 
 
@@ -81,22 +85,52 @@ class ModelUpdate(BaseModel):
     capabilities: list[str] | None = None
     pricing: dict[str, float] | None = None
     tags: list[str] | None = None
+    quality_score: float | None = Field(default=None, ge=0, le=1)
     enabled: bool | None = None
+
+
+def validate_virtual_model_config(candidates: list[dict[str, Any]], strategy_config: dict[str, float]) -> None:
+    for candidate in candidates:
+        if not candidate.get("model_id") and not candidate.get("model"):
+            raise ValueError("each candidate requires model_id or model")
+        for field in ("weight", "quality_score", "reliability_score"):
+            if field not in candidate:
+                continue
+            try:
+                value = float(candidate[field])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"candidate {field} must be numeric") from exc
+            if not isfinite(value) or value < 0 or (field != "weight" and value > 1):
+                raise ValueError(f"candidate {field} is out of range")
+    if any(not isfinite(value) or value < 0 for value in strategy_config.values()):
+        raise ValueError("strategy_config weights must be finite and non-negative")
 
 
 class VirtualModelCreate(BaseModel):
     project_id: str
     name: str = Field(min_length=1, max_length=120)
-    strategy: Literal["priority", "cheapest"] = "priority"
+    strategy: Literal["priority", "cheapest", "fastest", "weighted_random", "weighted_score"] = "priority"
     candidates: list[dict[str, Any]] = Field(min_length=1)
+    strategy_config: dict[str, float] = Field(default_factory=dict)
     enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_config(self) -> "VirtualModelCreate":
+        validate_virtual_model_config(self.candidates, self.strategy_config)
+        return self
 
 
 class VirtualModelUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
-    strategy: Literal["priority", "cheapest"] | None = None
+    strategy: Literal["priority", "cheapest", "fastest", "weighted_random", "weighted_score"] | None = None
     candidates: list[dict[str, Any]] | None = Field(default=None, min_length=1)
+    strategy_config: dict[str, float] | None = None
     enabled: bool | None = None
+
+    @model_validator(mode="after")
+    def validate_config(self) -> "VirtualModelUpdate":
+        validate_virtual_model_config(self.candidates or [], self.strategy_config or {})
+        return self
 
 
 class APIKeyCreate(BaseModel):
@@ -217,9 +251,21 @@ class PromptRender(BaseModel):
 
 
 class EvaluationRun(BaseModel):
+    evaluation_type: Literal["rule_set", "llm_judge"] = "rule_set"
     request_id: str | None = None
     output_text: str | None = None
-    checks: dict[str, Any] = Field(min_length=1)
+    checks: dict[str, Any] = Field(default_factory=dict)
+    judge_model_id: str | None = None
+    rubric: str | None = None
+    asynchronous: bool = False
+
+    @model_validator(mode="after")
+    def validate_evaluation(self) -> "EvaluationRun":
+        if self.evaluation_type == "rule_set" and not self.checks:
+            raise ValueError("checks is required for rule_set evaluation")
+        if self.evaluation_type == "llm_judge" and (not self.judge_model_id or not self.rubric):
+            raise ValueError("judge_model_id and rubric are required for llm_judge evaluation")
+        return self
 
 
 class AdminUserCreate(BaseModel):
@@ -231,3 +277,7 @@ class AdminUserCreate(BaseModel):
 class AdminLogin(BaseModel):
     email: str
     password: str
+
+class AdminUserUpdate(BaseModel):
+    role: Literal["owner", "admin", "developer", "viewer"] | None = None
+    active: bool | None = None

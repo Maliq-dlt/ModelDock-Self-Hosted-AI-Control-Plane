@@ -9,7 +9,7 @@ Laporkan kerentanan secara privat ke maintainer. Jangan membuka issue publik yan
 - Admin user dapat login melalui `POST /api/auth/login`, lalu memakai `Authorization: Bearer md_admin_*`.
 - Admin session berlaku delapan jam dan ditandatangani HMAC-SHA256 menggunakan `ADMIN_SESSION_SECRET` atau fallback `ADMIN_API_KEY`.
 - Password admin disimpan sebagai hash `scrypt` dengan salt acak.
-- Role `owner`, `admin`, `developer`, dan `viewer` tersedia. Pembuatan serta daftar admin user dibatasi ke `owner` dan `admin`; endpoint management lain memerlukan admin terautentikasi.
+- Role `owner`, `admin`, `developer`, dan `viewer` tersedia. Permission dibedakan berdasarkan method/resource; `admin` dapat mengelola user non-owner, sedangkan hanya `owner` dapat membuat atau mengubah owner. `POST /api/auth/logout-all` menaikkan session version dan mencabut semua session user.
 
 `X-ModelDock-Admin-Key` adalah credential berkekuatan penuh dan melewati pemeriksaan role. Batasi pemakaiannya ke bootstrap, dashboard server-side, dan automation tepercaya.
 
@@ -50,6 +50,7 @@ Budget project dapat memblokir request sebelum provider dipanggil. `Idempotency-
 
 - Request body dibatasi oleh `MAX_REQUEST_BODY_BYTES`.
 - Timeout provider dan retry aman diterapkan per attempt.
+- Provider concurrency limit, failure counter, reliability score, dan circuit breaker cooldown mencegah traffic terus dikirim ke provider gagal.
 - Error `408`, `409`, `425`, `429`, dan `5xx` dapat di-retry; error lain tidak.
 - Rate limiter memakai Redis dan fallback in-process saat Redis tidak tersedia.
 - CORS dibatasi melalui `CORS_ORIGINS`.
@@ -63,4 +64,5 @@ Budget project dapat memblokir request sebelum provider dipanggil. `Idempotency-
 5. Biarkan `LOG_PAYLOADS=false` kecuali ada kebutuhan eksplisit dan kebijakan retensi memadai.
 6. Atur `CORS_ORIGINS` ke origin dashboard produksi.
 7. Aktifkan OTLP hanya ke collector tepercaya dan audit atribut yang diekspor.
-8. Jalankan migration sebelum menerima traffic.
+8. Pastikan NetworkPolicy mengizinkan DNS dan hanya egress provider yang diperlukan pada TCP 80/443.
+9. Jalankan migration sebelum menerima traffic.

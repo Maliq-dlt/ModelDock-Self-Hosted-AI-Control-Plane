@@ -15,10 +15,15 @@ from app.core.db import get_session
 from app.core.rate_limit import enforce_rate_limit
 from app.models import APIKey, AdminUser
 
+ROLE_PERMISSIONS = {
+    "owner": {"*"},
+    "admin": {"read", "write", "audit", "ops", "users"},
+    "developer": {"read", "write"},
+    "viewer": {"read"},
+}
 
 class CredentialConfigurationError(RuntimeError):
     pass
-
 
 def hash_api_key(raw_key: str) -> str:
     secret = get_settings().api_key_hash_secret
@@ -26,18 +31,15 @@ def hash_api_key(raw_key: str) -> str:
         raise CredentialConfigurationError("API_KEY_HASH_SECRET is required")
     return hmac.new(secret.encode(), raw_key.encode(), hashlib.sha256).hexdigest()
 
-
 def create_api_key(environment: str = "live") -> tuple[str, str, str]:
     raw_key = f"md_{environment}_{secrets.token_urlsafe(32)}"
     return raw_key, raw_key[:16], hash_api_key(raw_key)
-
 
 def encrypt_credentials(credentials: dict) -> str:
     key = get_settings().credential_encryption_key
     if not key:
         raise CredentialConfigurationError("CREDENTIAL_ENCRYPTION_KEY is required to store provider credentials")
     return Fernet(key.encode()).encrypt(json.dumps(credentials).encode()).decode()
-
 
 def decrypt_credentials(value: str | None) -> dict:
     if not value:
@@ -50,24 +52,19 @@ def decrypt_credentials(value: str | None) -> dict:
     except (InvalidToken, ValueError, TypeError) as exc:
         raise CredentialConfigurationError("Provider credentials cannot be decrypted") from exc
 
-
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
-
 
 def _b64(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).decode().rstrip("=")
 
-
 def _unb64(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
-
 
 def hash_password(password: str) -> str:
     salt = secrets.token_bytes(16)
     derived = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1)
     return f"scrypt${_b64(salt)}${_b64(derived)}"
-
 
 def verify_password(password: str, encoded: str) -> bool:
     try:
@@ -79,22 +76,30 @@ def verify_password(password: str, encoded: str) -> bool:
     except (ValueError, TypeError):
         return False
 
-
 def create_admin_token(user: AdminUser) -> str:
     now = int(datetime.now(timezone.utc).timestamp())
     header = _b64(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
-    payload = _b64(json.dumps({"sub": user.id, "role": user.role, "iat": now, "exp": now + 8 * 60 * 60}, separators=(",", ":")).encode())
+    payload = _b64(
+        json.dumps(
+            {
+                "sub": user.id,
+                "role": user.role,
+                "ver": user.session_version,
+                "iat": now,
+                "exp": now + 8 * 60 * 60,
+            },
+            separators=(",", ":"),
+        ).encode()
+    )
     signing_input = f"{header}.{payload}"
     secret = (get_settings().admin_session_secret or get_settings().admin_api_key).encode()
     signature = _b64(hmac.new(secret, signing_input.encode(), hashlib.sha256).digest())
     return f"md_admin_{signing_input}.{signature}"
 
-
 def verify_admin_token(token: str) -> dict:
     if not token.startswith("md_admin_"):
         raise ValueError("invalid admin token")
-    value = token.removeprefix("md_admin_")
-    parts = value.split(".")
+    parts = token.removeprefix("md_admin_").split(".")
     if len(parts) != 3:
         raise ValueError("invalid admin token")
     signing_input = f"{parts[0]}.{parts[1]}"
@@ -107,8 +112,24 @@ def verify_admin_token(token: str) -> dict:
         raise ValueError("admin token expired")
     return payload
 
+def required_admin_permission(request: Request) -> str:
+    path = request.url.path
+    if path.startswith("/api/audit-logs"):
+        return "audit"
+    if path.startswith("/api/retention") or path == "/api/evaluations/process-next":
+        return "ops"
+    if path.startswith("/api/auth/users"):
+        return "users"
+    if path in {"/api/auth/me", "/api/auth/logout-all"}:
+        return "read"
+    return "read" if request.method in {"GET", "HEAD", "OPTIONS"} else "write"
+
+def has_admin_permission(role: str, permission: str) -> bool:
+    permissions = ROLE_PERMISSIONS.get(role, set())
+    return "*" in permissions or permission in permissions
 
 async def require_admin(
+    request: Request,
     x_modeldock_admin_key: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
     session: AsyncSession = Depends(get_session),
@@ -120,21 +141,29 @@ async def require_admin(
         try:
             payload = verify_admin_token(authorization.removeprefix("Bearer ").strip())
             user = await session.get(AdminUser, payload["sub"])
-            if user and user.active:
-                return user
+            if not user or not user.active or int(payload.get("ver", -1)) != user.session_version:
+                raise ValueError("admin session revoked")
+            permission = required_admin_permission(request)
+            if not has_admin_permission(user.role, permission):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient admin permission")
+            return user
+        except HTTPException:
+            raise
         except (ValueError, KeyError, TypeError):
             pass
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin authentication required")
 
+async def require_admin_user(user: AdminUser | None = Depends(require_admin)) -> AdminUser:
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin user session required")
+    return user
 
 def require_admin_role(*roles: str):
     async def dependency(user: AdminUser | None = Depends(require_admin)) -> AdminUser | None:
         if user is not None and user.role not in roles:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient admin role")
         return user
-
     return dependency
-
 
 async def require_api_key(
     request: Request,

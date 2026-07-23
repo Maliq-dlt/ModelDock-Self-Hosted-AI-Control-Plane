@@ -71,6 +71,10 @@ class Provider(Base):
     health_status: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown")
     last_health_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_health_latency_ms: Mapped[float | None] = mapped_column(Float)
+    concurrency_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=8)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    circuit_open_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reliability_score: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
@@ -87,6 +91,7 @@ class ModelRecord(Base):
     capabilities_json: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     pricing_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     tags_json: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    quality_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.5)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
@@ -197,6 +202,11 @@ class Evaluation(Base):
     evaluation_type: Mapped[str] = mapped_column(String(50), nullable=False)
     score: Mapped[float | None] = mapped_column(Float)
     result_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="completed")
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
@@ -220,6 +230,7 @@ class AdminUser(Base):
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[str] = mapped_column(String(30), nullable=False, default="viewer")
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    session_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 

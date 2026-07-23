@@ -4,7 +4,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app
 WORKDIR /app
 
 COPY apps/api ./
-COPY scripts/seed_demo.py scripts/retention.py ./scripts/
+COPY scripts/seed_demo.py scripts/retention.py scripts/evaluation_worker.py ./scripts/
 RUN pip install --no-cache-dir .
 
 EXPOSE 8080

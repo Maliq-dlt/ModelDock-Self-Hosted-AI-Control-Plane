@@ -1,6 +1,6 @@
 # ModelDock
 
-Self-hosted AI control plane untuk menghubungkan banyak provider melalui satu API kompatibel OpenAI. Platform menyediakan registry provider/model, virtual model, priority/cheapest routing, rule-based routing, retry/fallback, streaming, project API key, quota, idempotency, trace, token/cost tracking, prompt registry, evaluation, budget blocking, dashboard, PostgreSQL, Redis, OpenTelemetry, dan Docker Compose.
+Self-hosted AI control plane untuk menghubungkan banyak provider melalui satu API kompatibel OpenAI. Platform menyediakan registry provider/model, virtual model, priority/cheapest/fastest/weighted routing, rule-based routing, retry/fallback, circuit breaker, streaming, project API key, quota, idempotency, trace, token/cost tracking, prompt registry, rule dan LLM-judge evaluation, budget blocking, dashboard, PostgreSQL, Redis, OpenTelemetry, dan Docker Compose.
 
 ## Quick Start
 
@@ -89,7 +89,7 @@ Provider types: `openai`, `gemini`, `groq`, `ollama`, dan `openai_compatible`. C
 
 - Client memakai project API key `md_live_*` atau `md_test_*`.
 - Request model dapat menunjuk virtual model atau model langsung.
-- `priority` mencoba kandidat sesuai urutan; `cheapest` mengurutkan metadata biaya.
+- `priority` mencoba kandidat sesuai urutan; `cheapest` mengurutkan metadata biaya; `fastest` memakai latency health terakhir; `weighted_random` memakai bobot; `weighted_score` menggabungkan health, reliability, quality, latency, dan cost.
 - Error `408`, `409`, `425`, `429`, dan `5xx` dapat di-retry.
 - Setelah retry habis, request pindah ke kandidat berikutnya.
 - Setiap attempt tersimpan di trace yang sama.
@@ -99,7 +99,8 @@ Provider types: `openai`, `gemini`, `groq`, `ollama`, dan `openai_compatible`. C
 - `Idempotency-Key` mencegah pengulangan request non-streaming yang sudah sukses.
 - `stream=true` meneruskan SSE dari OpenAI-compatible/Groq, NDJSON Ollama, dan SSE Gemini.
 - Routing rules mendukung condition match, `route_to`, deny, capability, tag, dan context-window requirement.
-- Prompt versions dapat dirender, diaktifkan, dan di-rollback. Evaluation checks mencakup contains, regex, exact match, length, latency, dan cost.
+- Provider failure state menjalankan concurrency limit, reliability tracking, dan circuit breaker cooldown sebelum kandidat dipakai lagi.
+- Prompt versions dapat dirender, diaktifkan, dan di-rollback. Evaluation checks mencakup contains, regex, exact match, length, latency, dan cost. Evaluation dapat sinkron, masuk durable queue, atau memakai LLM judge dari provider/model terdaftar.
 
 ## Development
 
@@ -139,12 +140,12 @@ FastAPI gateway
   | API key + rate limit + budget
   v
 Virtual-model router
-  | priority / cheapest + retry / fallback
+  | priority / cheapest / fastest / weighted + rules + retry / fallback
   v
 OpenAI | Gemini | Groq | Ollama | OpenAI-compatible
   |
   +--> PostgreSQL traces, attempts, tokens, cost
-  +--> Redis distributed rate counters
+  +--> Redis distributed rate and concurrency counters
   +--> Next.js dashboard
 ```
 
@@ -162,9 +163,9 @@ Lihat `SECURITY.md` sebelum deployment produksi.
 
 ## Current MVP Scope
 
-Selesai: provider/model management, project/environment setup, virtual models, priority/cheapest/rule routing, safe retry/fallback, streaming adapters, API keys/quota, idempotency, trace attempts, usage forecast, prompt registry, evaluations, monthly project budget blocking, admin JWT/RBAC, audit logs, retention, Prometheus metrics, optional OpenTelemetry, dashboard CRUD/charts/filter, migration, seed, CI, Docker Compose, dan Kubernetes baseline.
+Selesai pada v0.2.0: provider/model management, project/environment setup, virtual models, priority/cheapest/fastest/weighted/rule routing, safe retry/fallback, provider concurrency dan circuit breaker, streaming adapters, API keys/quota, idempotency, trace attempts, usage forecast, prompt registry, rule dan LLM-judge evaluations dengan durable worker queue, monthly project budget blocking, admin JWT/RBAC dan session revocation, audit logs, retention, Prometheus metrics, optional OpenTelemetry, dashboard CRUD/charts/filter, migration, seed, CI, Docker Compose, dan Kubernetes/Helm baseline.
 
-Batasan tersisa: OAuth provider integration, multi-region orchestration, managed database HA, GPU scheduler, Kubernetes operator, dan true LLM-as-judge belum termasuk; deployment Kubernetes tersedia sebagai single-cluster baseline.
+Batasan tersisa: OAuth provider integration, multi-region orchestration, managed database HA, GPU scheduler, Kubernetes operator, dan semantic routing. Deployment Kubernetes/Helm tetap single-cluster baseline; external provider egress perlu disesuaikan dengan jaringan cluster.
 
 ## License
 

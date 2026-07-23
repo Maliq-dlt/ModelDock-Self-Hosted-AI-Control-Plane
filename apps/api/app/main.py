@@ -24,7 +24,7 @@ async def lifespan(_: FastAPI):
     yield
     await dispose_db()
 
-app = FastAPI(title="ModelDock API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="ModelDock API", version="0.2.0", lifespan=lifespan)
 if settings.otel_exporter_otlp_endpoint:
     tracer_provider = TracerProvider(resource=Resource.create({"service.name": "modeldock-api"}))
     tracer_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=settings.otel_exporter_otlp_endpoint)))

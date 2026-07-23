@@ -9,6 +9,8 @@ Bootstrap membuat `.env` dengan secret lokal acak, lalu Compose menjalankan migr
 docker compose up --build
 ```
 
+API menjalankan `alembic upgrade head` sebelum Uvicorn. Evaluation worker tidak membuat schema; worker menunggu database/migration siap dan retry saat database belum tersedia.
+
 Migration manual:
 
 ```powershell
@@ -22,6 +24,18 @@ Invoke-RestMethod http://localhost:8080/health
 Invoke-RestMethod http://localhost:8080/ready
 ```
 
+## Evaluation Queue
+
+Evaluation rule dapat diproses sinkron. Payload dengan `asynchronous=true` masuk tabel queue dan diproses worker Compose/Kubernetes:
+
+```powershell
+docker compose logs -f worker
+Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/evaluations/process-next `
+  -Headers @{ 'X-ModelDock-Admin-Key' = $env:ADMIN_API_KEY }
+```
+
+LLM judge harus menunjuk `judge_model_id` yang provider-nya enabled. Output request dapat dikirim ke provider tersebut; jangan gunakan judge untuk payload sensitif tanpa kebijakan data yang sesuai.
+
 ## Admin Session
 
 Dashboard memakai `MODELDOCK_ADMIN_API_KEY` server-side. Client admin lain dapat memperoleh session delapan jam:
@@ -32,6 +46,12 @@ $login = Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/auth/logi
   -Body (@{ email = $env:BOOTSTRAP_ADMIN_EMAIL; password = $env:BOOTSTRAP_ADMIN_PASSWORD } | ConvertTo-Json)
 $headers = @{ Authorization = "Bearer $($login.access_token)" }
 Invoke-RestMethod -Headers $headers -Uri http://localhost:8080/api/projects
+```
+
+Cabut seluruh session user:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/auth/logout-all -Headers $headers
 ```
 
 ## Backup
@@ -65,15 +85,16 @@ Atau panggil `POST /api/retention/run` memakai admin credential. Request attempt
 
 Prometheus text tersedia di `/metrics`. Set `OTEL_EXPORTER_OTLP_ENDPOINT` untuk mengirim FastAPI spans ke collector OTLP HTTP. Provider credential dan authorization header tidak diekspor.
 
-## Kubernetes
+## Kubernetes dan Helm
 
 Validasi manifest tanpa mengubah cluster:
 
 ```powershell
 kubectl apply --dry-run=client -f deployments/kubernetes/modeldock.yaml
+helm template modeldock deployments/helm/modeldock
 ```
 
-Manifest adalah baseline single-cluster. Production memerlukan Ingress TLS, secret manager, image registry, network policy, autoscaling, PostgreSQL/Redis HA, dan backup terjadwal.
+Manifest dan chart adalah baseline single-cluster. NetworkPolicy mengizinkan DNS serta TCP 80/443 untuk provider eksternal; batasi CIDR/egress sesuai cluster sebelum production. Production memerlukan Ingress TLS, secret manager, image registry, autoscaling, PostgreSQL/Redis HA, backup terjadwal, dan observability.
 
 ## Production Baseline
 

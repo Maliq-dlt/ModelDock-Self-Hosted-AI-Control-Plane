@@ -2,7 +2,7 @@ import asyncio
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import pool
+from sqlalchemy import pool, text
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from app import models  # noqa: F401
@@ -31,7 +31,14 @@ def run_sync_migrations(connection) -> None:
 async def run_migrations_online() -> None:
     connectable = async_engine_from_config(config.get_section(config.config_ini_section, {}), prefix="sqlalchemy.", poolclass=pool.NullPool)
     async with connectable.connect() as connection:
-        await connection.run_sync(run_sync_migrations)
+        locked = connection.dialect.name == "postgresql"
+        if locked:
+            await connection.execute(text("SELECT pg_advisory_lock(71390142)"))
+        try:
+            await connection.run_sync(run_sync_migrations)
+        finally:
+            if locked:
+                await connection.execute(text("SELECT pg_advisory_unlock(71390142)"))
     await connectable.dispose()
 
 

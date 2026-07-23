@@ -17,10 +17,12 @@ flowchart LR
     API --> PostgreSQL["PostgreSQL"]
     API --> Redis["Redis rate counters"]
     API --> Metrics["Prometheus metrics"]
+    API --> Worker["Evaluation worker"]
+    Worker --> Judge["Registered judge provider/model"]
     API -. optional .-> OTLP["OTLP collector"]
 ```
 
-FastAPI memiliki gateway dan management API. PostgreSQL menyimpan konfigurasi, governance, trace, usage, dan audit. Redis menyimpan rate counter terdistribusi dengan fallback in-process. Next.js memanggil management API dari server sehingga admin key tidak masuk browser JavaScript.
+FastAPI memiliki gateway dan management API. PostgreSQL menyimpan konfigurasi, governance, trace, usage, dan audit. Redis menyimpan rate dan concurrency counter terdistribusi dengan fallback in-process. Next.js memanggil management API dari server sehingga admin key tidak masuk browser JavaScript.
 
 ## Alur Request
 
@@ -32,7 +34,8 @@ Authorization dan IP check
   -> routing-rule match
   -> virtual/direct model resolution
   -> capability, tag, dan context-window filtering
-  -> priority atau cheapest ordering
+  -> priority / cheapest / fastest / weighted ordering
+  -> provider concurrency dan circuit breaker filter
   -> provider attempt dengan timeout dan safe retry
   -> fallback kandidat berikutnya
   -> response OpenAI normalization
@@ -44,12 +47,13 @@ Request streaming memakai jalur yang sama. OpenAI/Groq/custom meneruskan SSE, Ol
 ## Routing dan Policy
 
 - Direct model menghasilkan strategi `static`.
-- Virtual model mendukung `priority` dan `cheapest`.
+- Virtual model mendukung `priority`, `cheapest`, `fastest`, `weighted_random`, dan `weighted_score`.
 - Routing rules dievaluasi berdasarkan priority lalu waktu pembuatan.
 - Condition mendukung equality, `less_than`, `greater_than`, `in`, dan `contains`.
 - Action dapat `route_to`, `deny`, atau menetapkan requirement capability, tag, dan minimum context window.
 - Simulation endpoint mengembalikan kandidat terpilih dan kandidat yang ditolak tanpa memanggil provider.
 - Retry hanya untuk kegagalan sementara; attempt dan fallback tetap berada dalam satu trace.
+- Health latency, reliability, model quality, dan cost menjadi metadata routing; circuit-open provider ditolak sampai cooldown selesai.
 
 ## Provider Adapter
 
@@ -68,7 +72,7 @@ OpenAI-compatible adapter meneruskan tools, tool choice, dan response format. Cr
 - Project API key: HMAC hash, expiry, revocation, rotation, allowlist, RPM, token quota, dan concurrency.
 - Budget: batas bulanan project, warning threshold, projected usage, dan blocking sebelum provider call.
 - Prompt registry: template, immutable versions, active version, rendering, dan rollback melalui aktivasi versi lama.
-- Evaluation: rule checks untuk contains, regex, exact match, length, latency, dan cost; hasil dapat terhubung ke trace.
+- Evaluation: rule checks untuk contains, regex, exact match, length, latency, dan cost; job asynchronous tersimpan durable dan diproses worker. LLM judge memakai provider/model terdaftar dan mengembalikan score/reason.
 - Admin: bootstrap key, signed admin session, password hashing, role untuk user administration, dan audit log perubahan.
 - Retention: request/attempt dan audit log dapat dipurge berdasarkan umur.
 
@@ -99,8 +103,8 @@ audit_logs
 
 ## Deployment
 
-Docker Compose menjalankan API, web, PostgreSQL, dan Redis. Manifest Kubernetes menyediakan baseline single-cluster dengan Secret eksternal. Production tetap memerlukan HTTPS/Ingress, image registry, database/cache HA, backup jobs, secret manager, autoscaling, dan kebijakan jaringan.
+Docker Compose menjalankan API, web, PostgreSQL, Redis, dan evaluation worker. Manifest Kubernetes serta Helm chart menyediakan baseline single-cluster dengan Secret eksternal, HPA, PDB API, worker, dan NetworkPolicy. Production tetap memerlukan HTTPS/Ingress, image registry, database/cache HA, backup jobs, secret manager, autoscaling, dan kebijakan jaringan provider yang sesuai.
 
 ## Batas Saat Ini
 
-Belum termasuk OAuth provider, multi-region orchestration, Kubernetes operator, GPU scheduler, managed PostgreSQL/Redis HA, semantic routing, dan LLM-as-judge. Fitur itu berada di luar MVP v0.1 pada spesifikasi.
+Belum termasuk OAuth provider, multi-region orchestration, Kubernetes operator, GPU scheduler, managed PostgreSQL/Redis HA, dan semantic routing. LLM-as-judge tersedia pada v0.2.0 melalui provider/model yang sudah diregistrasikan.
