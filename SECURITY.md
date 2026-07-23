@@ -1,6 +1,6 @@
 # Security
 
-Laporkan kerentanan secara privat ke maintainer. Jangan membuka issue publik yang memuat exploit, credential, token, atau data request.
+Laporkan kerentanan melalui GitHub Security Advisories atau maintainer secara privat. Jangan membuka issue publik yang memuat exploit, credential, token, atau data request.
 
 ## Batas Autentikasi
 
@@ -66,3 +66,9 @@ Budget project dapat memblokir request sebelum provider dipanggil. `Idempotency-
 7. Aktifkan OTLP hanya ke collector tepercaya dan audit atribut yang diekspor.
 8. Pastikan NetworkPolicy mengizinkan DNS dan hanya egress provider yang diperlukan pada TCP 80/443.
 9. Jalankan migration sebelum menerima traffic.
+## Token Efficiency Safety
+
+- `safe` hanya memadatkan tool JSON, menghapus ANSI, dan menormalkan line ending.
+- `caveman` dan `ponytail` memberi instruksi gaya; tidak memotong atau meringkas output model.
+- `max_tokens`, tool schema, code block, user message, dan system policy tetap dipertahankan.
+- Jangan aktifkan mode pada payload sensitif tanpa memastikan trace policy dan provider egress sesuai.

@@ -19,6 +19,7 @@ jobs:
       - run: pip install ".[test]" ruff
       - run: ruff check app tests
       - run: pytest
+      - run: python -m py_compile ../../scripts/tokenpress.py
       - name: Check migrations on fresh SQLite
         env:
           DATABASE_URL: sqlite+aiosqlite:///./.tmp/ci-migrations.db

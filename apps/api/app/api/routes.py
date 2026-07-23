@@ -1,4 +1,3 @@
-import json
 import re
 import time
 from calendar import monthrange
@@ -16,24 +15,31 @@ from app.core.concurrency import request_slot
 from app.core.config import get_settings
 from app.core.db import get_session
 from app.core.security import CredentialConfigurationError, create_admin_token, create_api_key, encrypt_credentials, hash_password, require_admin, require_admin_role, require_admin_user, require_api_key, verify_password
-from app.models import APIKey, AdminUser, AuditLog, Budget, Environment, Evaluation, ModelRecord, PromptTemplate, PromptVersion, Project, Provider, RequestAttempt, RequestRecord, RoutingRule, VirtualModel
+from app.models import APIKey, AdminUser, AuditLog, Budget, Environment, Evaluation, ModelRecord, PromptTemplate, PromptVersion, Project, Provider, ProviderAccount, RequestAttempt, RequestRecord, RoutingRule, VirtualModel
 from app.providers.adapters import ProviderError, adapter_for
-from app.schemas import APIKeyCreate, APIKeyUpdate, AdminLogin, AdminUserCreate, AdminUserUpdate, BudgetCreate, BudgetUpdate, ChatCompletionRequest, EvaluationRun, ModelCreate, ModelUpdate, PromptActivate, PromptCreate, PromptRender, PromptVersionCreate, ProjectCreate, ProviderCreate, ProviderUpdate, RoutingRuleCreate, RoutingRuleUpdate, RoutingSimulation, VirtualModelCreate, VirtualModelUpdate
+from app.schemas import APIKeyCreate, APIKeyUpdate, AdminLogin, AdminUserCreate, AdminUserUpdate, AnthropicMessagesRequest, BudgetCreate, BudgetUpdate, ChatCompletionRequest, EvaluationRun, ModelCreate, ModelUpdate, PromptActivate, PromptCreate, PromptRender, PromptVersionCreate, ProjectCreate, ProviderAccountCreate, ProviderAccountUpdate, ProviderCreate, ProviderUpdate, ResponsesRequest, RoutingRuleCreate, RoutingRuleUpdate, RoutingSimulation, TokenPolicyUpdate, VirtualModelCreate, VirtualModelUpdate
 from app.routing.engine import resolve_route
 from app.services.evaluations import evaluate_payload, process_next_evaluation
 from app.services.gateway import BudgetExceeded, QuotaExceeded, execute_chat, prepare_stream_chat, stream_chat_events
+from app.services.provider_accounts import select_provider_account
 from app.services.provider_health import record_provider_failure, record_provider_success
+from app.services.protocols import ProtocolName, anthropic_to_chat, format_error, responses_to_chat, stream_replay
 from app.services.retention import purge_retained_data
+from app.services.token_efficiency import mode_from_policy, optimize_request
 
 router = APIRouter()
 admin = APIRouter(prefix="/api", dependencies=[Depends(require_admin)])
 auth_router = APIRouter(prefix="/api/auth")
 
 def project_json(project: Project) -> dict[str, Any]:
-    return {"id": project.id, "name": project.name, "slug": project.slug, "description": project.description, "created_at": project.created_at}
+    return {"id": project.id, "name": project.name, "slug": project.slug, "description": project.description, "token_policy": {"safe": False, "caveman": False, "ponytail": False, **(project.token_policy_json or {})}, "created_at": project.created_at}
 
 def provider_json(provider: Provider) -> dict[str, Any]:
     return {"id": provider.id, "name": provider.name, "provider_type": provider.provider_type, "base_url": provider.base_url, "timeout_seconds": provider.timeout_seconds, "concurrency_limit": provider.concurrency_limit, "enabled": provider.enabled, "has_credentials": bool(provider.encrypted_credentials), "health_status": provider.health_status, "last_health_checked_at": provider.last_health_checked_at, "last_health_latency_ms": provider.last_health_latency_ms, "consecutive_failures": provider.consecutive_failures, "circuit_open_until": provider.circuit_open_until, "reliability_score": provider.reliability_score, "created_at": provider.created_at, "updated_at": provider.updated_at}
+
+def provider_account_json(account: ProviderAccount) -> dict[str, Any]:
+    return {"id": account.id, "provider_id": account.provider_id, "name": account.name, "priority": account.priority, "enabled": account.enabled, "quota_remaining": account.quota_remaining, "quota_reset_at": account.quota_reset_at, "last_used_at": account.last_used_at, "has_credentials": bool(account.encrypted_credentials), "created_at": account.created_at, "updated_at": account.updated_at}
+
 
 def model_json(model: ModelRecord) -> dict[str, Any]:
     return {"id": model.id, "provider_id": model.provider_id, "model_name": model.model_name, "display_name": model.display_name, "context_window": model.context_window, "capabilities": model.capabilities_json, "pricing": model.pricing_json, "tags": model.tags_json, "quality_score": model.quality_score, "enabled": model.enabled, "created_at": model.created_at, "updated_at": model.updated_at}
@@ -88,6 +94,24 @@ async def create_project(payload: ProjectCreate, session: AsyncSession = Depends
 async def list_providers(session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
     return [provider_json(item) for item in (await session.scalars(select(Provider).order_by(Provider.created_at.desc()))).all()]
 
+@admin.get("/projects/{project_id}/token-policy")
+async def get_token_policy(project_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return {"project_id": project.id, "token_policy": project_json(project)["token_policy"], "effective_mode": mode_from_policy(project.token_policy_json)}
+
+
+@admin.patch("/projects/{project_id}/token-policy")
+async def update_token_policy(project_id: str, payload: TokenPolicyUpdate, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    project.token_policy_json = payload.model_dump()
+    await session.commit()
+    return {"project_id": project.id, "token_policy": project.token_policy_json, "effective_mode": mode_from_policy(project.token_policy_json)}
+
+
 @admin.post("/providers", status_code=status.HTTP_201_CREATED)
 async def create_provider(payload: ProviderCreate, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     try:
@@ -131,6 +155,55 @@ async def delete_provider(provider_id: str, session: AsyncSession = Depends(get_
     await session.delete(provider)
     await session.commit()
 
+@admin.get("/providers/{provider_id}/accounts")
+async def list_provider_accounts(provider_id: str, session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
+    if not await session.get(Provider, provider_id):
+        raise HTTPException(status_code=404, detail="Provider not found")
+    rows = (await session.scalars(select(ProviderAccount).where(ProviderAccount.provider_id == provider_id).order_by(ProviderAccount.priority, ProviderAccount.created_at))).all()
+    return [provider_account_json(item) for item in rows]
+
+
+@admin.post("/providers/{provider_id}/accounts", status_code=status.HTTP_201_CREATED)
+async def create_provider_account(provider_id: str, payload: ProviderAccountCreate, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    if not await session.get(Provider, provider_id):
+        raise HTTPException(status_code=404, detail="Provider not found")
+    try:
+        encrypted = encrypt_credentials(payload.credentials)
+    except CredentialConfigurationError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    account = ProviderAccount(provider_id=provider_id, name=payload.name, encrypted_credentials=encrypted, priority=payload.priority, enabled=payload.enabled, quota_remaining=payload.quota_remaining, quota_reset_at=payload.quota_reset_at)
+    session.add(account)
+    await commit_or_conflict(session, "Provider account already exists")
+    return provider_account_json(account)
+
+
+@admin.patch("/providers/{provider_id}/accounts/{account_id}")
+async def update_provider_account(provider_id: str, account_id: str, payload: ProviderAccountUpdate, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    account = await session.scalar(select(ProviderAccount).where(ProviderAccount.id == account_id, ProviderAccount.provider_id == provider_id))
+    if not account:
+        raise HTTPException(status_code=404, detail="Provider account not found")
+    values = payload.model_dump(exclude_unset=True)
+    credentials = values.pop("credentials", None)
+    if credentials is not None:
+        try:
+            account.encrypted_credentials = encrypt_credentials(credentials)
+        except CredentialConfigurationError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+    for key, value in values.items():
+        setattr(account, key, value)
+    await commit_or_conflict(session, "Provider account already exists")
+    return provider_account_json(account)
+
+
+@admin.delete("/providers/{provider_id}/accounts/{account_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_provider_account(provider_id: str, account_id: str, session: AsyncSession = Depends(get_session)) -> None:
+    account = await session.scalar(select(ProviderAccount).where(ProviderAccount.id == account_id, ProviderAccount.provider_id == provider_id))
+    if not account:
+        raise HTTPException(status_code=404, detail="Provider account not found")
+    await session.delete(account)
+    await session.commit()
+
+
 @admin.post("/providers/{provider_id}/test")
 async def test_provider(provider_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     provider = await session.get(Provider, provider_id)
@@ -141,7 +214,11 @@ async def test_provider(provider_id: str, session: AsyncSession = Depends(get_se
         raise HTTPException(status_code=409, detail="Register an enabled model before testing provider")
     started = time.perf_counter()
     try:
-        healthy = await adapter_for(provider, model).health_check()
+        account, pool_configured = await select_provider_account(session, provider.id)
+        if pool_configured and account is None:
+            raise ProviderError(429, "provider_account_quota_exhausted", "All provider accounts are quota-blocked")
+        adapter = adapter_for(provider, model, account) if account else adapter_for(provider, model)
+        healthy = await adapter.health_check()
         latency_ms = (time.perf_counter() - started) * 1000
         if healthy:
             record_provider_success(provider, latency_ms)
@@ -160,6 +237,34 @@ async def test_provider(provider_id: str, session: AsyncSession = Depends(get_se
 @admin.get("/models")
 async def list_models(session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
     return [model_json(item) for item in (await session.scalars(select(ModelRecord).order_by(ModelRecord.created_at.desc()))).all()]
+
+@admin.post("/providers/{provider_id}/models/sync")
+async def sync_provider_models(provider_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    provider = await session.get(Provider, provider_id)
+    if not provider:
+        raise HTTPException(status_code=404, detail="Provider not found")
+    account, pool_configured = await select_provider_account(session, provider.id)
+    if pool_configured and account is None:
+        raise HTTPException(status_code=409, detail="All provider accounts are quota-blocked")
+    catalog_model = ModelRecord(provider_id=provider.id, model_name="catalog-sync")
+    adapter = adapter_for(provider, catalog_model, account) if account else adapter_for(provider, catalog_model)
+    catalog = await adapter.list_models()
+    synced = []
+    for item in catalog:
+        model = await session.scalar(select(ModelRecord).where(ModelRecord.provider_id == provider.id, ModelRecord.model_name == item.model_name))
+        if not model:
+            model = ModelRecord(provider_id=provider.id, model_name=item.model_name)
+            session.add(model)
+        model.display_name = item.display_name or model.display_name
+        model.context_window = item.context_window or model.context_window
+        model.capabilities_json = item.capabilities or model.capabilities_json or ["chat"]
+        if item.pricing:
+            model.pricing_json = item.pricing
+        model.enabled = True
+        synced.append(model)
+    await commit_or_conflict(session, "Provider model catalog contains duplicate models")
+    return {"provider_id": provider.id, "synced": len(synced), "models": [model_json(item) for item in synced]}
+
 
 @admin.post("/models", status_code=status.HTTP_201_CREATED)
 async def create_model(payload: ModelCreate, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
@@ -359,40 +464,68 @@ async def get_trace(trace_id: str, session: AsyncSession = Depends(get_session))
     if not request_record:
         raise HTTPException(status_code=404, detail="Trace not found")
     attempts = (await session.scalars(select(RequestAttempt).where(RequestAttempt.request_id == request_record.id).order_by(RequestAttempt.attempt_number))).all()
-    return {"trace_id": request_record.trace_id, "status": request_record.status, "virtual_model": request_record.virtual_model, "selected_model_id": request_record.selected_model_id, "provider_id": request_record.provider_id, "usage": {"prompt_tokens": request_record.prompt_tokens, "completion_tokens": request_record.completion_tokens, "total_tokens": request_record.total_tokens, "estimated_cost": request_record.estimated_cost}, "latency_ms": request_record.latency_ms, "started_at": request_record.started_at, "completed_at": request_record.completed_at, "metadata": request_record.metadata_json, "attempts": [{"attempt_number": item.attempt_number, "provider_id": item.provider_id, "model_id": item.model_id, "status": item.status, "error_type": item.error_type, "error_message": item.error_message, "latency_ms": item.latency_ms, "estimated_cost": item.estimated_cost, "started_at": item.started_at, "completed_at": item.completed_at} for item in attempts]}
+    return {"trace_id": request_record.trace_id, "status": request_record.status, "virtual_model": request_record.virtual_model, "selected_model_id": request_record.selected_model_id, "provider_id": request_record.provider_id, "usage": {"prompt_tokens": request_record.prompt_tokens, "completion_tokens": request_record.completion_tokens, "total_tokens": request_record.total_tokens, "estimated_cost": request_record.estimated_cost}, "latency_ms": request_record.latency_ms, "started_at": request_record.started_at, "completed_at": request_record.completed_at, "metadata": request_record.metadata_json, "attempts": [{"attempt_number": item.attempt_number, "provider_id": item.provider_id, "provider_account_id": item.provider_account_id, "model_id": item.model_id, "status": item.status, "error_type": item.error_type, "error_message": item.error_message, "latency_ms": item.latency_ms, "estimated_cost": item.estimated_cost, "started_at": item.started_at, "completed_at": item.completed_at} for item in attempts]}
+
+@admin.get("/traces/{trace_id}/replay")
+async def replay_trace(trace_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    request_record = await session.scalar(select(RequestRecord).where(RequestRecord.trace_id == trace_id))
+    if not request_record:
+        raise HTTPException(status_code=404, detail="Trace not found")
+    metadata = request_record.metadata_json or {}
+    context = metadata.get("routing_context") or {}
+    try:
+        candidates, decision = await resolve_route(session, request_record.project_id, request_record.virtual_model, context)
+    except HTTPException as exc:
+        return {"trace_id": trace_id, "status": "unavailable", "error": exc.detail, "original": metadata.get("routing_decision") or {}}
+    current = [{"provider": item.provider.name, "model": item.model.model_name} for item in candidates]
+    original = metadata.get("selected") or {}
+    changed = bool(current) and (current[0].get("provider") != original.get("provider") or current[0].get("model") != original.get("model"))
+    return {"trace_id": trace_id, "status": "ready", "changed": changed, "original": {"provider": original.get("provider"), "model": original.get("model")}, "current": current, "decision": decision}
+
 
 @admin.get("/usage/summary")
 async def usage_summary(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    row = (await session.execute(select(func.count(RequestRecord.id), func.coalesce(func.sum(RequestRecord.total_tokens), 0), func.coalesce(func.sum(RequestRecord.estimated_cost), 0.0), func.coalesce(func.avg(RequestRecord.latency_ms), 0.0), func.coalesce(func.sum(func.cast(RequestRecord.status == "error", Integer)), 0)).where(RequestRecord.started_at >= start))).one()
+    row = (await session.execute(select(func.count(RequestRecord.id), func.coalesce(func.sum(RequestRecord.prompt_tokens), 0), func.coalesce(func.sum(RequestRecord.completion_tokens), 0), func.coalesce(func.sum(RequestRecord.total_tokens), 0), func.coalesce(func.sum(RequestRecord.estimated_cost), 0.0), func.coalesce(func.avg(RequestRecord.latency_ms), 0.0), func.coalesce(func.sum(func.cast(RequestRecord.status == "error", Integer)), 0)).where(RequestRecord.started_at >= start))).one()
+    records = (await session.scalars(select(RequestRecord.metadata_json).where(RequestRecord.started_at >= start))).all()
+    input_tokens_saved = sum(int((item or {}).get("token_efficiency", {}).get("input_tokens_saved", 0) or 0) for item in records)
     elapsed_days = max(1, (datetime.now(timezone.utc).date() - start.date()).days + 1)
     now = datetime.now(timezone.utc)
     days_in_month = monthrange(now.year, now.month)[1]
-    projected_cost = float(row[2]) / elapsed_days * days_in_month
-    return {"period_start": start, "requests": int(row[0]), "total_tokens": int(row[1]), "estimated_cost": float(row[2]), "projected_monthly_cost": projected_cost, "average_latency_ms": float(row[3]), "errors": int(row[4])}
+    projected_cost = float(row[4]) / elapsed_days * days_in_month
+    return {"period_start": start, "requests": int(row[0]), "input_tokens": int(row[1]), "output_tokens": int(row[2]), "total_tokens": int(row[3]), "estimated_cost": float(row[4]), "projected_monthly_cost": projected_cost, "average_latency_ms": float(row[5]), "errors": int(row[6]), "input_tokens_saved": input_tokens_saved}
+
 
 @admin.get("/usage/timeseries")
 async def usage_timeseries(days: int = Query(default=30, ge=1, le=365), session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
     start = datetime.now(timezone.utc) - timedelta(days=days - 1)
     rows = (await session.scalars(select(RequestRecord).where(RequestRecord.started_at >= start).order_by(RequestRecord.started_at))).all()
     buckets: dict[str, dict[str, Any]] = {}
+    for index in range(days):
+        date_key = (start.date() + timedelta(days=index)).isoformat()
+        buckets[date_key] = {"date": date_key, "requests": 0, "input_tokens": 0, "output_tokens": 0, "tokens": 0, "estimated_cost": 0.0}
     for item in rows:
         key = item.started_at.date().isoformat()
-        bucket = buckets.setdefault(key, {"date": key, "requests": 0, "tokens": 0, "estimated_cost": 0.0})
+        bucket = buckets.setdefault(key, {"date": key, "requests": 0, "input_tokens": 0, "output_tokens": 0, "tokens": 0, "estimated_cost": 0.0})
         bucket["requests"] += 1
+        bucket["input_tokens"] += item.prompt_tokens
+        bucket["output_tokens"] += item.completion_tokens
         bucket["tokens"] += item.total_tokens
         bucket["estimated_cost"] += item.estimated_cost
     return list(buckets.values())
+
 
 @admin.get("/usage/by-model")
 async def usage_by_model(session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
     rows = (await session.execute(select(ModelRecord.model_name, func.count(RequestRecord.id), func.coalesce(func.sum(RequestRecord.total_tokens), 0), func.coalesce(func.sum(RequestRecord.estimated_cost), 0.0)).join(RequestRecord, RequestRecord.selected_model_id == ModelRecord.id).group_by(ModelRecord.model_name).order_by(func.sum(RequestRecord.estimated_cost).desc()))).all()
     return [{"model": row[0], "requests": int(row[1]), "total_tokens": int(row[2]), "estimated_cost": float(row[3])} for row in rows]
 
+
 @admin.get("/usage/by-provider")
 async def usage_by_provider(session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
     rows = (await session.execute(select(Provider.name, func.count(RequestRecord.id), func.coalesce(func.sum(RequestRecord.total_tokens), 0), func.coalesce(func.sum(RequestRecord.estimated_cost), 0.0)).join(RequestRecord, RequestRecord.provider_id == Provider.id).group_by(Provider.name).order_by(func.sum(RequestRecord.estimated_cost).desc()))).all()
     return [{"provider": row[0], "requests": int(row[1]), "total_tokens": int(row[2]), "estimated_cost": float(row[3])} for row in rows]
+
 
 @admin.get("/usage/by-project")
 async def usage_by_project(session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
@@ -407,25 +540,31 @@ async def openai_models(api_key: APIKey = Depends(require_api_key), session: Asy
     data.extend({"id": item.model_name, "object": "model", "created": int(item.created_at.timestamp()), "owned_by": "modeldock"} for item in models)
     return {"object": "list", "data": data}
 
-@router.post("/v1/chat/completions")
-async def chat_completions(
+async def _protocol_completion(
     payload: ChatCompletionRequest,
-    api_key: APIKey = Depends(require_api_key),
-    session: AsyncSession = Depends(get_session),
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> JSONResponse:
+    api_key: APIKey,
+    session: AsyncSession,
+    idempotency_key: str | None,
+    response_protocol: ProtocolName,
+) -> Response:
+    if payload.modeldock.token_mode == "inherit":
+        project = await session.get(Project, api_key.project_id)
+        effective_mode = mode_from_policy(project.token_policy_json if project else None)
+        payload = payload.model_copy(update={"modeldock": payload.modeldock.model_copy(update={"token_mode": effective_mode})})
+    payload, _ = optimize_request(payload)
     if payload.stream:
         slot = request_slot(f"api-key:{api_key.id}", api_key.concurrent_limit)
         try:
             await slot.__aenter__()
         except HTTPException as exc:
-            return JSONResponse(status_code=exc.status_code, content={"error": {"message": str(exc.detail), "type": "concurrency_limit", "code": "concurrency_limit"}})
+            return JSONResponse(status_code=exc.status_code, content=format_error(response_protocol, "concurrency_limit", str(exc.detail)))
         try:
-            trace_id, replay, record, candidates, decision, prompt_tokens = await prepare_stream_chat(session, api_key, payload, idempotency_key)
+            trace_id, replay, record, candidates, decision, prompt_tokens = await prepare_stream_chat(session, api_key, payload, idempotency_key, response_protocol)
         except (BudgetExceeded, QuotaExceeded) as exc:
             await slot.__aexit__(None, None, None)
             error_type = "budget_exceeded" if isinstance(exc, BudgetExceeded) else "quota_exceeded"
-            return JSONResponse(status_code=402 if error_type == "budget_exceeded" else 429, content={"error": {"message": str(exc), "type": error_type, "code": error_type}, "modeldock": {"trace_id": exc.trace_id}}, headers={"X-ModelDock-Trace-ID": exc.trace_id})
+            status_code = 402 if error_type == "budget_exceeded" else 429
+            return JSONResponse(status_code=status_code, content=format_error(response_protocol, error_type, str(exc), exc.trace_id), headers={"X-ModelDock-Trace-ID": exc.trace_id})
         except BaseException:
             await slot.__aexit__(None, None, None)
             raise
@@ -433,31 +572,63 @@ async def chat_completions(
         async def events():
             try:
                 if replay:
-                    message = ((replay.get("choices") or [{}])[0].get("message") or {})
-                    payload_chunk = {"id": replay.get("id"), "object": "chat.completion.chunk", "created": int(time.time()), "model": replay.get("model", payload.model), "choices": [{"index": 0, "delta": {"content": message.get("content") or ""}, "finish_reason": None}], "modeldock": replay.get("modeldock", {"trace_id": trace_id})}
-                    yield f'data: {json.dumps(payload_chunk, separators=(",", ":"))}\n\n'
-                    yield "data: [DONE]\n\n"
-                    return
-                async for event in stream_chat_events(session, payload, trace_id, record, candidates, decision, prompt_tokens, idempotency_key):
-                    yield event
+                    for event in stream_replay(response_protocol, payload, replay, trace_id):
+                        yield event
+                else:
+                    async for event in stream_chat_events(session, payload, trace_id, record, candidates, decision, prompt_tokens, idempotency_key, response_protocol):
+                        yield event
             finally:
                 await slot.__aexit__(None, None, None)
 
         return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-ModelDock-Trace-ID": trace_id})
     try:
         async with request_slot(f"api-key:{api_key.id}", api_key.concurrent_limit):
-            response, trace_id = await execute_chat(session, api_key, payload, idempotency_key)
+            response, trace_id = await execute_chat(session, api_key, payload, idempotency_key, response_protocol)
     except (BudgetExceeded, QuotaExceeded) as exc:
         error_type = "budget_exceeded" if isinstance(exc, BudgetExceeded) else "quota_exceeded"
-        return JSONResponse(status_code=402 if error_type == "budget_exceeded" else 429, content={"error": {"message": str(exc), "type": error_type, "code": error_type}, "modeldock": {"trace_id": exc.trace_id}}, headers={"X-ModelDock-Trace-ID": exc.trace_id})
+        status_code = 402 if error_type == "budget_exceeded" else 429
+        return JSONResponse(status_code=status_code, content=format_error(response_protocol, error_type, str(exc), exc.trace_id), headers={"X-ModelDock-Trace-ID": exc.trace_id})
     except ProviderError as exc:
-        body: dict[str, Any] = {"error": {"message": exc.message, "type": exc.error_type, "code": exc.error_type}}
-        headers = {}
-        if exc.trace_id:
-            body["modeldock"] = {"trace_id": exc.trace_id}
-            headers["X-ModelDock-Trace-ID"] = exc.trace_id
-        return JSONResponse(status_code=exc.status_code if 400 <= exc.status_code < 600 else 502, content=body, headers=headers)
+        return JSONResponse(status_code=exc.status_code if 400 <= exc.status_code < 600 else 502, content=format_error(response_protocol, exc.error_type, exc.message, exc.trace_id), headers={"X-ModelDock-Trace-ID": exc.trace_id} if exc.trace_id else None)
     return JSONResponse(content=response, headers={"X-ModelDock-Trace-ID": trace_id})
+
+
+@router.post("/v1/chat/completions")
+async def chat_completions(
+    payload: ChatCompletionRequest,
+    api_key: APIKey = Depends(require_api_key),
+    session: AsyncSession = Depends(get_session),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> Response:
+    return await _protocol_completion(payload, api_key, session, idempotency_key, "openai")
+
+
+@router.post("/v1/responses")
+async def responses(
+    payload: ResponsesRequest,
+    api_key: APIKey = Depends(require_api_key),
+    session: AsyncSession = Depends(get_session),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> Response:
+    try:
+        request = responses_to_chat(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return await _protocol_completion(request, api_key, session, idempotency_key, "responses")
+
+
+@router.post("/v1/messages")
+async def messages(
+    payload: AnthropicMessagesRequest,
+    api_key: APIKey = Depends(require_api_key),
+    session: AsyncSession = Depends(get_session),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> Response:
+    try:
+        request = anthropic_to_chat(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return await _protocol_completion(request, api_key, session, idempotency_key, "anthropic")
 
 @admin.get("/routing-rules")
 async def list_routing_rules(project_id: str | None = None, session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:

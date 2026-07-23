@@ -14,6 +14,7 @@ async def test_openai_adapter_contract(monkeypatch) -> None:
     adapter = OpenAIAdapter(Provider(name="openai", provider_type="openai"), ModelRecord(provider_id="provider", model_name="model"))
 
     async def fake_send(*args, **kwargs):
+        assert "modeldock" not in kwargs["json"]
         return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 2, "completion_tokens": 1}})
 
     monkeypatch.setattr(adapter, "_send", fake_send)

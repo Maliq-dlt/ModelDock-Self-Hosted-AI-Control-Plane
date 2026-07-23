@@ -169,10 +169,11 @@ async def require_api_key(
     request: Request,
     session: AsyncSession = Depends(get_session),
     authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
 ) -> APIKey:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bearer API key required")
-    raw_key = authorization.removeprefix("Bearer ").strip()
+    raw_key = authorization.removeprefix("Bearer ").strip() if authorization and authorization.startswith("Bearer ") else (x_api_key or "").strip()
+    if not raw_key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API key required")
     try:
         key_hash = hash_api_key(raw_key)
     except CredentialConfigurationError as exc:

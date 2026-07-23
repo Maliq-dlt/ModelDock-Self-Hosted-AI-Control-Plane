@@ -1,5 +1,4 @@
 import asyncio
-import json
 import time
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
@@ -15,7 +14,9 @@ from app.core.config import get_settings
 from app.models import APIKey, Budget, Environment, ModelRecord, RequestAttempt, RequestRecord
 from app.providers.adapters import ProviderError, ProviderResponse, adapter_for
 from app.routing.engine import resolve_route
+from app.services.provider_accounts import select_provider_account
 from app.services.provider_health import record_provider_failure, record_provider_success
+from app.services.protocols import ProtocolName, format_response, response_id, stream_complete, stream_delta, stream_error, stream_start
 from app.schemas import ChatCompletionRequest
 
 
@@ -108,33 +109,14 @@ def openai_response(
     result: ProviderResponse,
     trace_id: str,
 ) -> dict[str, Any]:
-    message: dict[str, Any] = {
-        "role": "assistant",
-        "content": None if result.tool_calls and not result.content else result.content,
-    }
-    if result.tool_calls:
-        message["tool_calls"] = result.tool_calls
-    return {
-        "id": f"chatcmpl-{uuid4().hex}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": request.model,
-        "choices": [
-            {
-                "index": 0,
-                "message": message,
-                "finish_reason": result.finish_reason,
-            }
-        ],
-        "usage": result.usage,
-        "modeldock": {"trace_id": trace_id},
-    }
+    return format_response("openai", request, result, trace_id)
 
 
 async def _idempotent_replay(
     session: AsyncSession,
     api_key_id: str,
     idempotency_key: str | None,
+    response_protocol: ProtocolName,
 ) -> tuple[dict[str, Any], str] | None:
     if not idempotency_key:
         return None
@@ -146,7 +128,12 @@ async def _idempotent_replay(
     )
     if not existing:
         return None
-    response = (existing.metadata_json or {}).get("idempotency_response")
+    metadata = existing.metadata_json or {}
+    if metadata.get("response_protocol", "openai") != response_protocol:
+        error = ProviderError(409, "idempotency_conflict", "Idempotency-Key was already used with another response protocol")
+        error.trace_id = existing.trace_id
+        raise error
+    response = metadata.get("idempotency_response")
     if existing.status == "success" and response:
         return response, existing.trace_id
     error = ProviderError(
@@ -163,8 +150,9 @@ async def execute_chat(
     api_key: APIKey,
     request: ChatCompletionRequest,
     idempotency_key: str | None = None,
+    response_protocol: ProtocolName = "openai",
 ) -> tuple[dict[str, Any], str]:
-    replay = await _idempotent_replay(session, api_key.id, idempotency_key)
+    replay = await _idempotent_replay(session, api_key.id, idempotency_key, response_protocol)
     if replay:
         return replay
     trace_id = f"trc_{uuid4().hex[:24]}"
@@ -172,9 +160,11 @@ async def execute_chat(
         raise RuntimeError("API key environment not found")
     prompt_tokens = approximate_tokens(request.messages)
     settings = get_settings()
-    initial_metadata: dict[str, Any] = {}
+    initial_metadata: dict[str, Any] = {"response_protocol": response_protocol}
     if settings.log_payloads:
         initial_metadata["request"] = request.model_dump(mode="json", exclude_none=True)
+    if request.metadata.get("modeldock_token_efficiency"):
+        initial_metadata["token_efficiency"] = request.metadata["modeldock_token_efficiency"]
     request_record = RequestRecord(
         trace_id=trace_id,
         project_id=api_key.project_id,
@@ -206,7 +196,9 @@ async def execute_chat(
         "data_classification": request.data_classification,
         "estimated_prompt_tokens": prompt_tokens,
         "metadata": request.metadata,
+        "routing_key": request.metadata.get("routing_key") or trace_id,
     }
+    initial_metadata["routing_context"] = route_context
     candidates, decision = await resolve_route(
         session,
         api_key.project_id,
@@ -233,12 +225,17 @@ async def execute_chat(
             await session.flush()
             started = time.perf_counter()
             try:
+                account, pool_configured = await select_provider_account(session, candidate.provider.id)
+                if pool_configured and account is None:
+                    raise ProviderError(429, "provider_account_quota_exhausted", "All provider accounts are quota-blocked", retryable=False)
+                attempt.provider_account_id = account.id if account else None
                 try:
                     async with request_slot(
                         f"provider:{candidate.provider.id}",
                         candidate.provider.concurrency_limit or 1,
                     ):
-                        response = await adapter_for(candidate.provider, candidate.model).chat(request)
+                        adapter = adapter_for(candidate.provider, candidate.model, account) if account else adapter_for(candidate.provider, candidate.model)
+                        response = await adapter.chat(request)
                 except HTTPException as exc:
                     raise ProviderError(
                         exc.status_code,
@@ -273,19 +270,23 @@ async def execute_chat(
                 request_record.estimated_cost = cost
                 request_record.latency_ms = (time.perf_counter() - started_request) * 1000
                 request_record.completed_at = datetime.now(timezone.utc)
-                response_body = openai_response(request, response, trace_id)
+                response_body = format_response(response_protocol, request, response, trace_id)
                 response_metadata = (
                     {"content": response.content, "tool_calls": response.tool_calls}
                     if settings.log_payloads
                     else {}
                 )
+                selected = {
+                    "provider": candidate.provider.name,
+                    "model": candidate.model.model_name,
+                }
+                if account:
+                    selected["account"] = account.name
                 request_record.metadata_json = {
                     **initial_metadata,
                     **decision,
-                    "selected": {
-                        "provider": candidate.provider.name,
-                        "model": candidate.model.model_name,
-                    },
+                    "routing_decision": decision,
+                    "selected": selected,
                     **({"response": response_metadata} if response_metadata else {}),
                     **({"idempotency_response": response_body} if idempotency_key else {}),
                 }
@@ -336,8 +337,9 @@ async def prepare_stream_chat(
     api_key: APIKey,
     request: ChatCompletionRequest,
     idempotency_key: str | None = None,
+    response_protocol: ProtocolName = "openai",
 ) -> tuple[str, dict[str, Any] | None, RequestRecord | None, list[Any], dict[str, Any], int]:
-    replay = await _idempotent_replay(session, api_key.id, idempotency_key)
+    replay = await _idempotent_replay(session, api_key.id, idempotency_key, response_protocol)
     if replay:
         return replay[1], replay[0], None, [], {}, 0
     trace_id = f"trc_{uuid4().hex[:24]}"
@@ -345,7 +347,11 @@ async def prepare_stream_chat(
         raise RuntimeError("API key environment not found")
     prompt_tokens = approximate_tokens(request.messages)
     settings = get_settings()
-    initial_metadata = {"request": request.model_dump(mode="json", exclude_none=True)} if settings.log_payloads else {}
+    initial_metadata = {"response_protocol": response_protocol}
+    if settings.log_payloads:
+        initial_metadata["request"] = request.model_dump(mode="json", exclude_none=True)
+    if request.metadata.get("modeldock_token_efficiency"):
+        initial_metadata["token_efficiency"] = request.metadata["modeldock_token_efficiency"]
     record = RequestRecord(
         trace_id=trace_id,
         project_id=api_key.project_id,
@@ -367,24 +373,11 @@ async def prepare_stream_chat(
         record.metadata_json = {**initial_metadata, "error": {"type": "budget_exceeded" if isinstance(exc, BudgetExceeded) else "quota_exceeded", "message": str(exc)}}
         await session.commit()
         raise
-    context = {"task_type": request.task_type, "data_classification": request.data_classification, "estimated_prompt_tokens": prompt_tokens, "metadata": request.metadata}
+    context = {"task_type": request.task_type, "data_classification": request.data_classification, "estimated_prompt_tokens": prompt_tokens, "metadata": request.metadata, "routing_key": request.metadata.get("routing_key") or trace_id}
+    initial_metadata["routing_context"] = context
     candidates, decision = await resolve_route(session, api_key.project_id, request.model, context)
     record.metadata_json = {**initial_metadata, "routing_decision": decision}
     return trace_id, None, record, candidates, decision, prompt_tokens
-
-
-def _stream_event(completion_id: str, request: ChatCompletionRequest, trace_id: str, delta: str = "", finish_reason: str | None = None, usage: dict[str, int] | None = None) -> str:
-    payload: dict[str, Any] = {
-        "id": completion_id,
-        "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": request.model,
-        "choices": [{"index": 0, "delta": {"content": delta} if delta else {}, "finish_reason": finish_reason}],
-        "modeldock": {"trace_id": trace_id},
-    }
-    if usage is not None:
-        payload["usage"] = usage
-    return f'data: {json.dumps(payload, separators=(",", ":"))}\n\n'
 
 
 async def stream_chat_events(
@@ -396,12 +389,14 @@ async def stream_chat_events(
     decision: dict[str, Any],
     prompt_tokens: int,
     idempotency_key: str | None = None,
+    response_protocol: ProtocolName = "openai",
 ) -> AsyncIterator[str]:
-    completion_id = f"chatcmpl-{uuid4().hex}"
+    completion_id = response_id(response_protocol)
     attempt_number = 0
     started_request = time.perf_counter()
     settings = get_settings()
     final_error: ProviderError | None = None
+    protocol_started = False
     for candidate in candidates:
         for retry_index in range(settings.max_retries_per_provider + 1):
             attempt_number += 1
@@ -413,24 +408,29 @@ async def stream_chat_events(
             usage = {"prompt_tokens": prompt_tokens, "completion_tokens": 0, "total_tokens": prompt_tokens}
             streamed = False
             try:
+                account, pool_configured = await select_provider_account(session, candidate.provider.id)
+                if pool_configured and account is None:
+                    raise ProviderError(429, "provider_account_quota_exhausted", "All provider accounts are quota-blocked", retryable=False)
+                attempt.provider_account_id = account.id if account else None
                 try:
                     async with request_slot(
                         f"provider:{candidate.provider.id}",
                         candidate.provider.concurrency_limit or 1,
                     ):
-                        async for chunk in adapter_for(candidate.provider, candidate.model).stream_chat(request):
-                            streamed = True
+                        adapter = adapter_for(candidate.provider, candidate.model, account) if account else adapter_for(candidate.provider, candidate.model)
+                        if not protocol_started:
+                            for event in stream_start(response_protocol, completion_id, request, trace_id):
+                                yield event
+                            protocol_started = True
+                        async for chunk in adapter.stream_chat(request):
+                            streamed = streamed or bool(chunk.delta)
                             content_parts.append(chunk.delta)
                             if chunk.usage:
                                 usage = chunk.usage
-                            yield _stream_event(completion_id, request, trace_id, chunk.delta)
+                            for event in stream_delta(response_protocol, completion_id, request, trace_id, chunk.delta):
+                                yield event
                 except HTTPException as exc:
-                    raise ProviderError(
-                        exc.status_code,
-                        "provider_concurrency_limit",
-                        str(exc.detail),
-                        retryable=True,
-                    ) from exc
+                    raise ProviderError(exc.status_code, "provider_concurrency_limit", str(exc.detail), retryable=True) from exc
                 usage["completion_tokens"] = usage.get("completion_tokens", 0) or max(0, len("".join(content_parts)) // 4)
                 usage["total_tokens"] = usage.get("total_tokens", 0) or usage["prompt_tokens"] + usage["completion_tokens"]
                 latency_ms = (time.perf_counter() - started) * 1000
@@ -451,11 +451,15 @@ async def stream_chat_events(
                 record.estimated_cost = cost
                 record.latency_ms = (time.perf_counter() - started_request) * 1000
                 record.completed_at = datetime.now(timezone.utc)
-                final_body = {"id": completion_id, "object": "chat.completion", "model": request.model, "choices": [{"index": 0, "message": {"role": "assistant", "content": "".join(content_parts)}, "finish_reason": "stop"}], "usage": usage, "modeldock": {"trace_id": trace_id}}
-                record.metadata_json = {**(record.metadata_json or {}), **decision, "selected": {"provider": candidate.provider.name, "model": candidate.model.model_name}, **({"idempotency_response": final_body} if idempotency_key else {})}
+                content = "".join(content_parts)
+                final_body = format_response(response_protocol, request, ProviderResponse(content=content, usage=usage, finish_reason="stop", raw={}), trace_id, completion_id)
+                selected = {"provider": candidate.provider.name, "model": candidate.model.model_name}
+                if account:
+                    selected["account"] = account.name
+                record.metadata_json = {**(record.metadata_json or {}), **decision, "routing_decision": decision, "selected": selected, **({"idempotency_response": final_body} if idempotency_key else {})}
                 await session.commit()
-                yield _stream_event(completion_id, request, trace_id, finish_reason="stop", usage=usage)
-                yield "data: [DONE]\n\n"
+                for event in stream_complete(response_protocol, completion_id, request, trace_id, content, usage):
+                    yield event
                 return
             except ProviderError as exc:
                 if exc.retryable and exc.error_type != "provider_concurrency_limit":
@@ -477,6 +481,8 @@ async def stream_chat_events(
     record.completed_at = datetime.now(timezone.utc)
     record.metadata_json = {**(record.metadata_json or {}), **decision, "error": {"type": final_error.error_type if final_error else "provider_error", "message": final_error.message if final_error else "No provider succeeded"}}
     await session.commit()
-    error_payload = {"error": {"message": final_error.message if final_error else "No provider succeeded", "type": final_error.error_type if final_error else "provider_unavailable"}, "modeldock": {"trace_id": trace_id}}
-    yield f'data: {json.dumps(error_payload, separators=(",", ":"))}\n\n'
-    yield "data: [DONE]\n\n"
+    error_type = final_error.error_type if final_error else "provider_unavailable"
+    error_message = final_error.message if final_error else "No provider succeeded"
+    yield stream_error(response_protocol, error_type, error_message, trace_id)
+    if response_protocol == "openai":
+        yield "data: [DONE]\n\n"

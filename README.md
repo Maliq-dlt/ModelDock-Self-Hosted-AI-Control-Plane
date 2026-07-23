@@ -1,6 +1,10 @@
 # ModelDock
 
-Self-hosted AI control plane untuk menghubungkan banyak provider melalui satu API kompatibel OpenAI. Platform menyediakan registry provider/model, virtual model, priority/cheapest/fastest/weighted routing, rule-based routing, retry/fallback, circuit breaker, streaming, project API key, quota, idempotency, trace, token/cost tracking, prompt registry, rule dan LLM-judge evaluation, budget blocking, dashboard, PostgreSQL, Redis, OpenTelemetry, dan Docker Compose.
+[![CI](https://github.com/Maliq-dlt/ModelDock-Self-Hosted-AI-Control-Plane/actions/workflows/ci.yml/badge.svg)](https://github.com/Maliq-dlt/ModelDock-Self-Hosted-AI-Control-Plane/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/badge/release-v0.2.0-orange.svg)](CHANGELOG.md)
+
+Self-hosted AI control plane untuk menghubungkan banyak provider melalui satu API kompatibel OpenAI. Platform menyediakan registry provider/model, virtual model, priority/cheapest/fastest/weighted/canary routing, rule-based routing, retry/fallback, circuit breaker, streaming, project API key, quota, idempotency, trace, token/cost tracking, prompt registry, rule dan LLM-judge evaluation, budget blocking, TokenPress input efficiency, Caveman/Ponytail modes, dashboard topology/consumption, Decision Receipt replay, project TokenPress policy, PostgreSQL, Redis, OpenTelemetry, dan Docker Compose.
 
 ## Quick Start
 
@@ -83,7 +87,7 @@ Contoh virtual model priority:
 }
 ```
 
-Provider types: `openai`, `gemini`, `groq`, `ollama`, dan `openai_compatible`. Credential dikirim sebagai object `credentials`, dienkripsi dengan Fernet, dan tidak pernah dikembalikan API. Provider test menyimpan health status dan latency terakhir.
+Provider types: `openai`, `openai_responses`, `anthropic`, `gemini`, `groq`, `ollama`, dan `openai_compatible`. Credential dikirim sebagai object `credentials`, dienkripsi dengan Fernet, dan tidak pernah dikembalikan API. Provider test menyimpan health status dan latency terakhir.
 
 ## Gateway Behavior
 
@@ -101,6 +105,56 @@ Provider types: `openai`, `gemini`, `groq`, `ollama`, dan `openai_compatible`. C
 - Routing rules mendukung condition match, `route_to`, deny, capability, tag, dan context-window requirement.
 - Provider failure state menjalankan concurrency limit, reliability tracking, dan circuit breaker cooldown sebelum kandidat dipakai lagi.
 - Prompt versions dapat dirender, diaktifkan, dan di-rollback. Evaluation checks mencakup contains, regex, exact match, length, latency, dan cost. Evaluation dapat sinkron, masuk durable queue, atau memakai LLM judge dari provider/model terdaftar.
+
+## Competitive Gateway Core
+
+ModelDock exposes one internal request path for three client protocols:
+
+- `POST /v1/chat/completions` untuk OpenAI-compatible clients.
+- `POST /v1/responses` untuk OpenAI Responses clients.
+- `POST /v1/messages` untuk Anthropic Messages clients; API key dapat dikirim melalui `Authorization: Bearer` atau `x-api-key`.
+
+Provider adapters tersedia untuk `anthropic` dan `openai_responses`, selain adapter yang sudah ada. Adapter menerima request internal yang sama, menghasilkan `ProviderResponse` yang sama, dan dapat ditambah melalui `register_adapter()` tanpa mengubah gateway.
+
+Account pool:
+
+- `POST /api/providers/{provider_id}/accounts` menambah credential account terenkripsi.
+- Routing melewati account dengan `quota_remaining=0` sampai `quota_reset_at` lewat.
+- Trace menyimpan `provider_account_id` dan nama account terpilih tanpa credential.
+- `POST /api/providers/{provider_id}/models/sync` menyegarkan catalog provider tanpa menghapus model lama.
+
+Kompatibilitas tidak memotong output. Responses/Anthropic streaming meneruskan seluruh delta dan trace yang sama.
+
+## Token Efficiency
+
+TokenPress mengurangi overhead input tanpa memotong capability output:
+
+- `safe`: compact tool JSON, buang ANSI, normalisasi line ending; user/system/code tetap utuh.
+- `caveman`: safe mode + output guidance ringkas; detail teknis tetap wajib.
+- `ponytail`: safe mode + prinsip smallest sufficient code change.
+- `stacked`: Caveman + Ponytail.
+- Output tidak dipotong, tidak diringkas pascaproses, dan `max_tokens` tetap sama.
+- Stats before/after tersimpan pada trace sebagai `token_efficiency`.
+
+Project policy dapat diatur melalui `PATCH /api/projects/{project_id}/token-policy`; request `inherit` memakai policy project, sedangkan mode eksplisit menang override.
+
+Request example:
+
+```json
+{
+  "model": "smart-router",
+  "messages": [{"role": "user", "content": "Fix this service."}],
+  "modeldock": {"token_mode": "stacked"}
+}
+```
+
+Offline preprocess:
+
+```powershell
+Get-Content request.json | python scripts/tokenpress.py --mode safe
+```
+
+Design detail: `docs/token-efficiency.md`.
 
 ## Development
 
@@ -134,7 +188,7 @@ docker compose --env-file .env.example config
 
 ```text
 Client
-  | OpenAI-compatible request
+  | OpenAI Chat / Responses / Anthropic Messages
   v
 FastAPI gateway
   | API key + rate limit + budget
@@ -142,14 +196,14 @@ FastAPI gateway
 Virtual-model router
   | priority / cheapest / fastest / weighted + rules + retry / fallback
   v
-OpenAI | Gemini | Groq | Ollama | OpenAI-compatible
+OpenAI Chat | OpenAI Responses | Anthropic | Gemini | Groq | Ollama | OpenAI-compatible
   |
   +--> PostgreSQL traces, attempts, tokens, cost
   +--> Redis distributed rate and concurrency counters
   +--> Next.js dashboard
 ```
 
-Detail: `docs/architecture.md`.
+Detail: `docs/architecture.md`. Adapter contract: `docs/provider-adapters.md`.
 
 ## Security
 
@@ -161,11 +215,13 @@ Detail: `docs/architecture.md`.
 
 Lihat `SECURITY.md` sebelum deployment produksi.
 
+Project governance: `CONTRIBUTING.md`, `GOVERNANCE.md`, `SUPPORT.md`, dan `CHANGELOG.md`.
+
 ## Current MVP Scope
 
-Selesai pada v0.2.0: provider/model management, project/environment setup, virtual models, priority/cheapest/fastest/weighted/rule routing, safe retry/fallback, provider concurrency dan circuit breaker, streaming adapters, API keys/quota, idempotency, trace attempts, usage forecast, prompt registry, rule dan LLM-judge evaluations dengan durable worker queue, monthly project budget blocking, admin JWT/RBAC dan session revocation, audit logs, retention, Prometheus metrics, optional OpenTelemetry, dashboard CRUD/charts/filter, migration, seed, CI, Docker Compose, dan Kubernetes/Helm baseline.
+Baseline v0.2.0 plus Stage 1, Stage 2, dan Stage 3 (in progress): TokenPress safe/caveman/ponytail/stacked modes, provider/model management, project/environment setup, virtual models, priority/cheapest/fastest/weighted/canary/rule routing, safe retry/fallback, provider concurrency dan circuit breaker, streaming adapters, API keys/quota, idempotency, trace attempts, usage forecast, prompt registry, rule dan LLM-judge evaluations dengan durable worker queue, monthly project budget blocking, admin JWT/RBAC dan session revocation, audit logs, retention, Prometheus metrics, optional OpenTelemetry, orbital dashboard topology/consumption/policy controls, Decision Receipt replay, migration, seed, CI, Docker Compose, dan Kubernetes/Helm baseline.
 
-Batasan tersisa: OAuth provider integration, multi-region orchestration, managed database HA, GPU scheduler, Kubernetes operator, dan semantic routing. Deployment Kubernetes/Helm tetap single-cluster baseline; external provider egress perlu disesuaikan dengan jaringan cluster.
+Batasan tersisa: provider OAuth integration, automatic quota-header ingestion, multi-region orchestration, managed database HA, GPU scheduler, Kubernetes operator, shadow evaluation, tool-call success routing, dan cost/quality optimization. Deployment Kubernetes/Helm tetap single-cluster baseline; external provider egress perlu disesuaikan dengan jaringan cluster.
 
 ## License
 

@@ -34,7 +34,7 @@ Authorization dan IP check
   -> routing-rule match
   -> virtual/direct model resolution
   -> capability, tag, dan context-window filtering
-  -> priority / cheapest / fastest / weighted ordering
+  -> priority / cheapest / fastest / weighted / deterministic canary ordering
   -> provider concurrency dan circuit breaker filter
   -> provider attempt dengan timeout dan safe retry
   -> fallback kandidat berikutnya
@@ -47,11 +47,13 @@ Request streaming memakai jalur yang sama. OpenAI/Groq/custom meneruskan SSE, Ol
 ## Routing dan Policy
 
 - Direct model menghasilkan strategi `static`.
-- Virtual model mendukung `priority`, `cheapest`, `fastest`, `weighted_random`, dan `weighted_score`.
+- Virtual model mendukung `priority`, `cheapest`, `fastest`, `weighted_random`, `weighted_score`, dan `canary`.
 - Routing rules dievaluasi berdasarkan priority lalu waktu pembuatan.
 - Condition mendukung equality, `less_than`, `greater_than`, `in`, dan `contains`.
 - Action dapat `route_to`, `deny`, atau menetapkan requirement capability, tag, dan minimum context window.
 - Simulation endpoint mengembalikan kandidat terpilih dan kandidat yang ditolak tanpa memanggil provider.
+- Canary menghitung lane control/variant dari hash `routing_key`; key sama selalu menghasilkan lane sama.
+- Project TokenPress policy diwariskan saat request memakai `modeldock.token_mode=inherit`; request dapat override policy.
 - Retry hanya untuk kegagalan sementara; attempt dan fallback tetap berada dalam satu trace.
 - Health latency, reliability, model quality, dan cost menjadi metadata routing; circuit-open provider ditolak sampai cooldown selesai.
 
@@ -95,7 +97,7 @@ audit_logs
 
 ## Observability
 
-- Trace detail menampilkan lifecycle request dan semua provider attempt.
+- Trace detail menampilkan lifecycle request, semua provider attempt, dan Decision Receipt replay tanpa provider call.
 - Usage API menyediakan summary, timeseries, per-model, per-provider, dan per-project.
 - Provider test menyimpan status, waktu pemeriksaan, dan latency terakhir.
 - `/metrics` menyediakan metrik request format Prometheus.
@@ -107,4 +109,10 @@ Docker Compose menjalankan API, web, PostgreSQL, Redis, dan evaluation worker. M
 
 ## Batas Saat Ini
 
-Belum termasuk OAuth provider, multi-region orchestration, Kubernetes operator, GPU scheduler, managed PostgreSQL/Redis HA, dan semantic routing. LLM-as-judge tersedia pada v0.2.0 melalui provider/model yang sudah diregistrasikan.
+Belum termasuk OAuth provider, multi-region orchestration, Kubernetes operator, GPU scheduler, managed PostgreSQL/Redis HA, shadow evaluation, tool-call success routing, dan semantic routing. LLM-as-judge tersedia pada v0.2.0 melalui provider/model yang sudah diregistrasikan.
+
+## Competitive Gateway Core
+
+Gateway normalizes OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages into one internal `ChatCompletionRequest`. Provider adapters normalize each upstream response into `ProviderResponse`; protocol formatting happens after routing so retry, budget, cost, and trace behavior stay consistent.
+
+Provider account pools use encrypted per-account credentials and reset-aware quota fields. Router skips accounts with active quota blocks, while provider-level credentials remain backward-compatible fallback. Model catalog sync upserts discovered models without deleting manual records.

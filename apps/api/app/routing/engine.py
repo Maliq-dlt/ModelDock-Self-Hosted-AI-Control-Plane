@@ -1,3 +1,4 @@
+import hashlib
 import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -137,7 +138,7 @@ def _weighted_order(candidates: list[RouteCandidate]) -> list[RouteCandidate]:
                 break
     return ordered
 
-def _order_candidates(strategy: str, candidates: list[RouteCandidate], config: dict[str, float]) -> tuple[list[RouteCandidate], dict[str, Any]]:
+def _order_candidates(strategy: str, candidates: list[RouteCandidate], config: dict[str, float], context: dict[str, Any]) -> tuple[list[RouteCandidate], dict[str, Any]]:
     if strategy == "cheapest":
         candidates.sort(key=_cost)
         return candidates, {"reason": "cheapest strategy"}
@@ -146,6 +147,20 @@ def _order_candidates(strategy: str, candidates: list[RouteCandidate], config: d
         return candidates, {"reason": "fastest strategy"}
     if strategy == "weighted_random":
         return _weighted_order(candidates), {"reason": "weighted random strategy"}
+    if strategy == "canary":
+        percent = min(100.0, max(0.0, float(config.get("canary_percent", 5.0))))
+        routing_key = str(context.get("routing_key") or context.get("metadata", {}).get("routing_key") or "modeldock-default")
+        digest = hashlib.sha256(routing_key.encode()).hexdigest()
+        bucket = int(digest[:8], 16) % 10_000 / 100
+        variant = bucket < percent and len(candidates) > 1
+        ordered = [candidates[1], candidates[0], *candidates[2:]] if variant else candidates
+        return ordered, {
+            "reason": "deterministic canary strategy",
+            "canary_percent": percent,
+            "canary_bucket": bucket,
+            "canary_lane": "variant" if variant else "control",
+            "routing_key_hash": digest[:12],
+        }
     if strategy == "weighted_score":
         costs = [_cost(item) for item in candidates]
         latencies = [_latency(item) for item in candidates]
@@ -201,7 +216,7 @@ async def resolve_route(session: AsyncSession, project_id: str, requested_model:
         rejected.extend(requirement_rejections)
         if not candidates:
             raise HTTPException(status_code=503, detail={"message": "No enabled route candidates", "rejected_candidates": rejected})
-        ordered, order_decision = _order_candidates(virtual.strategy, candidates, virtual.configuration_json.get("strategy_config", {}))
+        ordered, order_decision = _order_candidates(virtual.strategy, candidates, virtual.configuration_json.get("strategy_config", {}), context)
         return ordered, {"virtual_model": requested_model, "strategy": virtual.strategy, **order_decision, "routing_rule": rule_decision, "rejected_candidates": rejected}
 
     direct = await _resolve_candidate(session, requested_model)

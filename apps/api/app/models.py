@@ -23,6 +23,7 @@ class Project(Base):
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     slug: Mapped[str] = mapped_column(String(120), nullable=False, unique=True)
     description: Mapped[str | None] = mapped_column(Text)
+    token_policy_json: Mapped[dict[str, bool]] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
@@ -75,6 +76,23 @@ class Provider(Base):
     consecutive_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     circuit_open_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     reliability_score: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class ProviderAccount(Base):
+    __tablename__ = "provider_accounts"
+    __table_args__ = (UniqueConstraint("provider_id", "name", name="uq_provider_accounts_provider_name"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    provider_id: Mapped[str] = mapped_column(String(36), ForeignKey("providers.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    encrypted_credentials: Mapped[str] = mapped_column(Text, nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    quota_remaining: Mapped[int | None] = mapped_column(Integer)
+    quota_reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
@@ -142,6 +160,7 @@ class RequestAttempt(Base):
     request_id: Mapped[str] = mapped_column(String(36), ForeignKey("requests.id", ondelete="CASCADE"), nullable=False)
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
     provider_id: Mapped[str] = mapped_column(String(36), ForeignKey("providers.id", ondelete="CASCADE"), nullable=False)
+    provider_account_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("provider_accounts.id", ondelete="SET NULL"))
     model_id: Mapped[str] = mapped_column(String(36), ForeignKey("models.id", ondelete="CASCADE"), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False)
     error_type: Mapped[str | None] = mapped_column(String(80))

@@ -7,6 +7,10 @@ function text(form: FormData, key: string): string {
   return String(form.get(key) ?? "").trim();
 }
 
+function checked(form: FormData, key: string): boolean {
+  return form.get(key) === "on";
+}
+
 function jsonObject(form: FormData, key: string): Record<string, unknown> {
   const value = text(form, key);
   return value ? JSON.parse(value) as Record<string, unknown> : {};
@@ -14,11 +18,13 @@ function jsonObject(form: FormData, key: string): Record<string, unknown> {
 
 export async function createProject(form: FormData) {
   await adminMutate("/api/projects", "POST", { name: text(form, "name"), slug: text(form, "slug") || undefined, description: text(form, "description") || undefined });
+  revalidatePath("/");
   revalidatePath("/manage");
 }
 
 export async function createProvider(form: FormData) {
   await adminMutate("/api/providers", "POST", { name: text(form, "name"), provider_type: text(form, "provider_type"), base_url: text(form, "base_url") || undefined, credentials: jsonObject(form, "credentials") });
+  revalidatePath("/");
   revalidatePath("/manage");
   revalidatePath("/providers");
 }
@@ -30,7 +36,15 @@ export async function createModel(form: FormData) {
 }
 
 export async function createVirtualModel(form: FormData) {
-  await adminMutate("/api/virtual-models", "POST", { project_id: text(form, "project_id"), name: text(form, "name"), strategy: text(form, "strategy"), candidates: text(form, "candidates").split(",").map(value => ({ model_id: value.trim() })).filter(value => value.model_id) });
+  const strategy = text(form, "strategy");
+  await adminMutate("/api/virtual-models", "POST", {
+    project_id: text(form, "project_id"),
+    name: text(form, "name"),
+    strategy,
+    candidates: text(form, "candidates").split(",").map(value => ({ model_id: value.trim() })).filter(value => value.model_id),
+    strategy_config: strategy === "canary" ? { canary_percent: Number(text(form, "canary_percent") || 5) } : {},
+  });
+  revalidatePath("/");
   revalidatePath("/manage");
 }
 
@@ -47,5 +61,17 @@ export async function createBudget(form: FormData) {
 
 export async function testProvider(form: FormData) {
   await adminMutate(`/api/providers/${text(form, "provider_id")}/test`, "POST", {});
+  revalidatePath("/");
   revalidatePath("/providers");
+}
+
+export async function updateTokenPolicy(form: FormData) {
+  const projectId = text(form, "project_id");
+  if (!projectId) return;
+  await adminMutate(`/api/projects/${projectId}/token-policy`, "PATCH", {
+    safe: checked(form, "safe"),
+    caveman: checked(form, "caveman"),
+    ponytail: checked(form, "ponytail"),
+  });
+  revalidatePath("/");
 }

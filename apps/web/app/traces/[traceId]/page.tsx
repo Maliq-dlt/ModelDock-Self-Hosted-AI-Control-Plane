@@ -20,13 +20,28 @@ type Detail = {
   attempts: Attempt[];
 };
 
+type Replay = {
+  trace_id: string;
+  status: "ready" | "unavailable";
+  changed?: boolean;
+  error?: unknown;
+  original: { provider?: string | null; model?: string | null };
+  current?: Array<{ provider: string; model: string }>;
+  decision?: Record<string, unknown>;
+};
+
 export default async function TraceDetail({
   params,
 }: {
   params: Promise<{ traceId: string }>;
 }) {
   const { traceId } = await params;
-  const trace = await adminFetch<Detail>(`/api/traces/${traceId}`);
+  const [trace, replay] = await Promise.all([
+    adminFetch<Detail>(`/api/traces/${traceId}`),
+    adminFetch<Replay>(`/api/traces/${traceId}/replay`).catch(() => null),
+  ]);
+  const current = replay?.current?.[0];
+  const reason = typeof replay?.decision?.reason === "string" ? replay.decision.reason : "Route cannot be recalculated.";
 
   return (
     <>
@@ -40,6 +55,19 @@ export default async function TraceDetail({
         </div>
         <span className={`status ${trace.status}`}>{trace.status}</span>
       </header>
+      <section className="decisionStrip replayStrip">
+        <div className="receiptStamp"><span>DR</span><small>Decision replay</small></div>
+        <div>
+          <p className="eyebrow">Current routing result</p>
+          <h2>{replay?.status === "ready" ? reason : "Replay unavailable"}</h2>
+          <p>{current ? `${current.provider} / ${current.model}` : "Original routing context no longer resolves."}</p>
+        </div>
+        <div className="receiptFacts">
+          <span>Original<strong>{replay?.original?.provider ?? "—"}</strong></span>
+          <span>Result<strong>{replay?.changed ? "changed" : "stable"}</strong></span>
+          <span>Provider calls<strong>zero</strong></span>
+        </div>
+      </section>
       <section className="timeline">
         {trace.attempts.map((attempt) => (
           <article key={attempt.attempt_number}>
