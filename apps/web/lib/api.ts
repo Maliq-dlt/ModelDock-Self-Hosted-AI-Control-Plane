@@ -91,3 +91,18 @@ export async function adminMutate<T>(path: string, method: string, body: unknown
   }
   return response.status === 204 ? (undefined as T) : response.json() as Promise<T>;
 }
+export type ApiKey = {
+  id: string;
+  project_id: string;
+  name: string;
+  key_prefix: string;
+  status: string;
+  environment_id: string;
+  expires_at: string | null;
+  last_used_at: string | null;
+  rate_limit_rpm: number;
+  token_limit_monthly: number | null;
+  concurrent_limit: number;
+  allowed_models: string[];
+  created_at: string;
+};
