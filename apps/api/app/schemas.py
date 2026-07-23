@@ -1,0 +1,233 @@
+from datetime import datetime
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class Message(BaseModel):
+    role: Literal["system", "user", "assistant", "tool"]
+    content: str | list[dict[str, Any]] | None = None
+    name: str | None = None
+    tool_call_id: str | None = None
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str = Field(min_length=1, max_length=160)
+    messages: list[Message] = Field(min_length=1, max_length=200)
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    top_p: float | None = Field(default=None, ge=0, le=1)
+    max_tokens: int | None = Field(default=None, gt=0, le=100_000)
+    max_completion_tokens: int | None = Field(default=None, gt=0, le=100_000)
+    stop: str | list[str] | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
+    response_format: dict[str, Any] | None = None
+    stream: bool = False
+    task_type: str | None = Field(default=None, max_length=80)
+    data_classification: str | None = Field(default=None, max_length=80)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_token_limit(self) -> "ChatCompletionRequest":
+        if self.max_tokens is not None and self.max_completion_tokens is not None:
+            raise ValueError("Use max_tokens or max_completion_tokens, not both")
+        return self
+
+
+class ProjectCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    slug: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = None
+
+
+class ProviderCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    provider_type: Literal["openai", "gemini", "groq", "ollama", "openai_compatible"]
+    credentials: dict[str, Any] = Field(default_factory=dict)
+    base_url: str | None = None
+    timeout_seconds: float = Field(default=30, gt=0, le=300)
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_provider_url(self) -> "ProviderCreate":
+        if self.provider_type == "openai_compatible" and not self.base_url:
+            raise ValueError("base_url is required for openai_compatible providers")
+        return self
+
+
+class ProviderUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    credentials: dict[str, Any] | None = None
+    base_url: str | None = None
+    timeout_seconds: float | None = Field(default=None, gt=0, le=300)
+    enabled: bool | None = None
+
+
+class ModelCreate(BaseModel):
+    provider_id: str
+    model_name: str = Field(min_length=1, max_length=160)
+    display_name: str | None = None
+    context_window: int = Field(default=8192, gt=0)
+    capabilities: list[str] = Field(default_factory=lambda: ["chat"])
+    pricing: dict[str, float] = Field(default_factory=dict)
+    tags: list[str] = Field(default_factory=list)
+    enabled: bool = True
+
+
+class ModelUpdate(BaseModel):
+    model_name: str | None = Field(default=None, min_length=1, max_length=160)
+    display_name: str | None = None
+    context_window: int | None = Field(default=None, gt=0)
+    capabilities: list[str] | None = None
+    pricing: dict[str, float] | None = None
+    tags: list[str] | None = None
+    enabled: bool | None = None
+
+
+class VirtualModelCreate(BaseModel):
+    project_id: str
+    name: str = Field(min_length=1, max_length=120)
+    strategy: Literal["priority", "cheapest"] = "priority"
+    candidates: list[dict[str, Any]] = Field(min_length=1)
+    enabled: bool = True
+
+
+class VirtualModelUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    strategy: Literal["priority", "cheapest"] | None = None
+    candidates: list[dict[str, Any]] | None = Field(default=None, min_length=1)
+    enabled: bool | None = None
+
+
+class APIKeyCreate(BaseModel):
+    project_id: str
+    environment_id: str | None = None
+    name: str = Field(min_length=1, max_length=120)
+    environment: Literal["live", "test"] = "live"
+    expires_at: datetime | None = None
+    rate_limit_rpm: int = Field(default=60, ge=0, le=100_000)
+    token_limit_monthly: int | None = Field(default=None, gt=0)
+    concurrent_limit: int = Field(default=4, ge=1, le=1_000)
+    allowed_models: list[str] = Field(default_factory=list)
+    allowed_ips: list[str] = Field(default_factory=list)
+
+
+class BudgetCreate(BaseModel):
+    scope_type: Literal["project"] = "project"
+    scope_id: str
+    period: Literal["monthly"] = "monthly"
+    limit_amount: float = Field(gt=0)
+    warning_threshold: float = Field(default=0.8, gt=0, le=1)
+    action_at_limit: Literal["warn", "block"] = "block"
+
+
+class BudgetUpdate(BaseModel):
+    limit_amount: float | None = Field(default=None, gt=0)
+    warning_threshold: float | None = Field(default=None, gt=0, le=1)
+    action_at_limit: Literal["warn", "block"] | None = None
+
+
+class ReadModel(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    provider_id: str
+    model_name: str
+    display_name: str | None
+    context_window: int
+    capabilities_json: list[str]
+    pricing_json: dict[str, Any]
+    tags_json: list[str]
+    enabled: bool
+
+
+class ReadProvider(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    provider_type: str
+    base_url: str | None
+    timeout_seconds: float
+    enabled: bool
+    has_credentials: bool = False
+
+
+class APIKeyUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    status: Literal["active", "revoked"] | None = None
+    expires_at: datetime | None = None
+    rate_limit_rpm: int | None = Field(default=None, ge=0, le=100_000)
+    token_limit_monthly: int | None = Field(default=None, gt=0)
+    concurrent_limit: int | None = Field(default=None, ge=1, le=1_000)
+    allowed_models: list[str] | None = None
+    allowed_ips: list[str] | None = None
+
+
+class RoutingRuleCreate(BaseModel):
+    project_id: str
+    name: str = Field(min_length=1, max_length=120)
+    priority: int = 100
+    condition: dict[str, Any] = Field(default_factory=dict)
+    action: dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+
+
+class RoutingRuleUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    priority: int | None = None
+    condition: dict[str, Any] | None = None
+    action: dict[str, Any] | None = None
+    enabled: bool | None = None
+
+
+class RoutingSimulation(BaseModel):
+    project_id: str
+    model: str
+    task_type: str | None = None
+    data_classification: str | None = None
+    estimated_prompt_tokens: int = Field(default=1, ge=0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class PromptCreate(BaseModel):
+    project_id: str
+    name: str = Field(min_length=1, max_length=120)
+    description: str | None = None
+    content: str = Field(min_length=1)
+    variables: list[str] = Field(default_factory=list)
+    model_configuration: dict[str, Any] = Field(default_factory=dict)
+    created_by: str | None = None
+
+
+class PromptVersionCreate(BaseModel):
+    content: str = Field(min_length=1)
+    variables: list[str] = Field(default_factory=list)
+    model_configuration: dict[str, Any] = Field(default_factory=dict)
+    created_by: str | None = None
+
+
+class PromptActivate(BaseModel):
+    version: int = Field(gt=0)
+
+
+class PromptRender(BaseModel):
+    variables: dict[str, Any] = Field(default_factory=dict)
+    version: int | None = Field(default=None, gt=0)
+
+
+class EvaluationRun(BaseModel):
+    request_id: str | None = None
+    output_text: str | None = None
+    checks: dict[str, Any] = Field(min_length=1)
+
+
+class AdminUserCreate(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=12, max_length=1024)
+    role: Literal["owner", "admin", "developer", "viewer"] = "viewer"
+
+
+class AdminLogin(BaseModel):
+    email: str
+    password: str

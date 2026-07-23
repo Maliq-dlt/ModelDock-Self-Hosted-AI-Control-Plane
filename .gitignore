@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+.next/
+
+# Local runtime
+.env
+.tmp/
+.cache/
+.uv-cache/
+tests/runtime/
+
+# IDE
+.vscode/
+.idea/
+
+# Test runner temp directories
+pytest-cache-files-*/
+
+# Generated package/build metadata
+*.egg-info/
+*.tsbuildinfo
